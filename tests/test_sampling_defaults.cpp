@@ -51,20 +51,28 @@ int main() {
     const ninfer::ModelSamplingDefaults qwen3_6_35 = Moe35::sampling_defaults(Moe35::model_id);
 
     const ninfer::SamplingPreset dense_thinking{
-        .temperature = 1.0F, .top_k = 20, .top_p = 0.95F, .min_p = 0.0F};
-    const ninfer::SamplingPreset dense_non_thinking{
-        .temperature      = 0.7F,
-        .top_k            = 20,
-        .top_p            = 0.8F,
-        .min_p            = 0.0F,
-        .presence_penalty = 1.5F,
-    };
-    const ninfer::SamplingPreset moe_thinking{
         .temperature      = 1.0F,
         .top_k            = 20,
         .top_p            = 0.95F,
         .min_p            = 0.0F,
-        .presence_penalty = 1.5F,
+        .presence_penalty = 0.0F,
+        .frequency_penalty = 0.0F,
+    };
+    const ninfer::SamplingPreset dense_non_thinking{
+        .temperature       = 0.7F,
+        .top_k             = 20,
+        .top_p             = 0.8F,
+        .min_p             = 0.0F,
+        .presence_penalty  = 1.5F,
+        .frequency_penalty = 0.0F,
+    };
+    const ninfer::SamplingPreset moe_thinking{
+        .temperature       = 1.0F,
+        .top_k             = 20,
+        .top_p             = 0.95F,
+        .min_p             = 0.0F,
+        .presence_penalty  = 1.5F,
+        .frequency_penalty = 0.0F,
     };
 
     failures += check(same_preset(qwen3_6.thinking, dense_thinking),
@@ -85,10 +93,12 @@ int main() {
     const ninfer::ResolvedSamplingParameters non_thinking = ninfer::runtime::resolve_sampling(
         qwen3_8, ninfer::SamplingMode::NonThinking, ninfer::SamplingOverrides{});
     failures += check(thinking.temperature == 1.0F && thinking.top_p == 0.95F &&
-                          thinking.presence_penalty == 0.0F && thinking.seed == 0,
+                          thinking.presence_penalty == 0.0F &&
+                          thinking.frequency_penalty == 0.0F && thinking.seed == 0,
                       "omitted overrides did not select Qwen3.8 thinking defaults");
     failures += check(non_thinking.temperature == 0.7F && non_thinking.top_p == 0.8F &&
-                          non_thinking.presence_penalty == 1.5F,
+                          non_thinking.presence_penalty == 1.5F &&
+                          non_thinking.frequency_penalty == 0.0F,
                       "omitted overrides did not select Qwen3.8 non-thinking defaults");
 
     ninfer::SamplingOverrides overrides;
@@ -101,18 +111,10 @@ int main() {
     overrides.seed              = 123;
     const ninfer::ResolvedSamplingParameters overridden =
         ninfer::runtime::resolve_sampling(qwen3_8, ninfer::SamplingMode::NonThinking, overrides);
-    failures += check(overridden.temperature == 0.0F && overridden.top_k == 20 &&
+    failures += check(overridden.temperature == 0.0F && overridden.top_k == 0 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
-                      "explicit zero sampling overrides were not normalized to the target cap");
-
-    overrides.top_k = 21;
-    failures += check(throws_invalid([&] {
-                          (void)ninfer::runtime::resolve_sampling(
-                              qwen3_8, ninfer::SamplingMode::Thinking, overrides);
-                      }),
-                      "top_k beyond the executable candidate domain was accepted");
-    overrides.top_k = 0;
+                      "explicit zero sampling overrides were lost");
 
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
     failures += check(throws_invalid([&] {

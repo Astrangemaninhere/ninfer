@@ -143,8 +143,13 @@ __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const
     for (int j = 0; j < overlay_len; ++j) {
         if (overlay[j] == v) { ++cnt; }
     }
-    if (cnt > 0) { x -= c.presence_penalty; }
-    if (c.frequency_penalty != 0.0f) { x -= c.frequency_penalty * static_cast<float>(cnt); }
+    float penalty = 0.0F;
+    if (cnt > 0) { penalty += c.presence_penalty; }
+    if (c.frequency_penalty != 0.0f) {
+        penalty += c.frequency_penalty * static_cast<float>(cnt);
+    }
+    if (penalty > kSamplingMaxPenalty) { penalty = kSamplingMaxPenalty; }
+    x -= penalty;
     return x;
 }
 
