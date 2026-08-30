@@ -70,6 +70,9 @@ struct WorkspacePlan {
 struct SequencePlanningInputs {
     WeightsProfile weights_profile;
     std::uint32_t capacity                 = 0;
+    // Explicit --kv-capacity page count (when set below capacity) shrinks the
+    // device page-pool floor: max_context then bounds only the rope domain.
+    std::optional<std::uint32_t> kv_capacity_tokens;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
