@@ -137,7 +137,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
                      .enable_mtp                = plan.features.mtp(),
-                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
+                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency + 1),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                  });
@@ -199,7 +199,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                     builder,
                     KVExecutionTableSpec{
                         .logical_page_capacity = logical_pages,
-                        .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
+                        .table_rows            = static_cast<std::int32_t>(plan.max_concurrency + 1),
                     }),
                 .layers      = 1,
                 .max_context = plan.capacity,
@@ -671,6 +671,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
+    impl->graph_capture_ceiling = inputs.graph_capture_ceiling;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_dtype            = inputs.kv_dtype;
@@ -745,6 +746,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
+        .graph_capture_ceiling = options.graph_capture_ceiling,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
         .context_cache       = options.context_cache,

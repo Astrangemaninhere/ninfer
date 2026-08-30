@@ -79,6 +79,7 @@ struct SequencePlanningInputs {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    std::uint32_t graph_capture_ceiling = 0;
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
@@ -103,6 +104,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    std::uint32_t graph_capture_ceiling = 0;
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;

@@ -12,6 +12,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
@@ -687,6 +688,11 @@ public:
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
+
+    // On-demand graph capture state (see DecodeGraphFamily comment).
+    std::uint32_t graph_capture_ceiling = 0;
+    void extend_ordinary_graphs(std::uint32_t batch_size, std::uint32_t frontier);
+    schedule::ExecutionCore make_execution_core();
     std::size_t vision_handoff_peak_bytes    = 0;
 
 private:

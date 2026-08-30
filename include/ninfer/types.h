@@ -122,6 +122,11 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // On-demand graph capture: 0 (default) captures the full decode ladder at
+    // startup; a positive value captures only segments fully below it and the
+    // runtime extends the family on demand as the decode frontier grows past
+    // each captured segment (one capture per growth crossing).
+    std::uint32_t graph_capture_ceiling = 0;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     LoadProgress load_progress;
