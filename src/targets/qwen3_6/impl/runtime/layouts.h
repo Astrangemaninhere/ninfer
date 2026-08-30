@@ -80,6 +80,9 @@ struct SequencePlanningInputs {
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
+    ColdPolicy cold_policy      = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
     int device          = 0;
     ContextCacheOptions context_cache;
 };
