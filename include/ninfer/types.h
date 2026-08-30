@@ -37,6 +37,15 @@ enum class EnginePurpose : std::uint8_t {
     CausalScoring,
 };
 
+// Entropy-coded cold KV pool. Window compresses fully-written pages that
+// are at least cold_keep_tokens behind the decode frontier; attention
+// producers decode those pages inline from fixed-size slots.
+enum class ColdPolicy : std::uint8_t {
+    None,
+    Window,
+    Host,
+};
+
 enum class KvCapacityMode : std::uint8_t {
     Explicit,
     Automatic,
@@ -124,6 +133,10 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    ColdPolicy cold_policy            = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens    = 128;
+    // Pinned host-memory budget for ColdPolicy::Host offload. Default 4 GiB.
+    std::uint64_t cold_host_bytes     = 4ULL << 30;
     LoadProgress load_progress;
 };
 
