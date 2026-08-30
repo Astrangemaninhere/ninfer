@@ -729,8 +729,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
-      cold_policy(plan.cold_policy), cold_keep_tokens(plan.cold_keep_tokens),
-      cold_host_bytes(plan.cold_host_bytes),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
@@ -10595,124 +10593,6 @@ void ProgramImplCore::prepare_graphs() {
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
 }
 
-// Cold-pool maintenance: compress fully-written pages that are at least
-// cold_keep_tokens behind the decode frontier into raw nibble slots (rev 2b).
-// The sentinel is page-wide, so every full-attention layer must be
-// cold-capable (int8 or nvfp4 storage with requant support).
-void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
-    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
-        decoder->text_kv.slot_bytes() == 0) {
-        return;
-    }
-    const std::uint32_t layers = decoder->text_kv.layers();
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        const DType stored = decoder->text_kv.batch_layer_view(layer).dtype;
-        if (stored != DType::I8 && stored != DType::NVFP4) { return; }
-    }
-    if (sequence.text_kv_valid <= cold_keep_tokens) { return; }
-
-    const std::int32_t requant_heads =
-        decoder->text_kv.batch_layer_view(0).num_kv_heads;
-    if (cold_requant_heads != static_cast<std::uint32_t>(requant_heads)) {
-        if (cold_requant_codes != nullptr) {
-            (void)cudaFree(cold_requant_codes);
-            (void)cudaFree(cold_requant_scales);
-        }
-        CUDA_CHECK(cudaMalloc(&cold_requant_codes,
-                              8192ULL * static_cast<std::uint64_t>(requant_heads)));
-        CUDA_CHECK(cudaMalloc(&cold_requant_scales,
-                              1024ULL * static_cast<std::uint64_t>(requant_heads)));
-        cold_requant_heads = static_cast<std::uint32_t>(requant_heads);
-    }
-
-    const std::uint32_t behind = sequence.text_kv_valid - cold_keep_tokens;
-    const std::uint32_t last_page =
-        std::min(behind / static_cast<std::uint32_t>(kPagedKVPageSize),
-                 sequence.kv->text.mapped_page_count());
-
-    struct Candidate { std::uint32_t page; std::int32_t slot; };
-    std::vector<Candidate> candidates;
-    for (std::uint32_t page = 0; page < last_page; ++page) {
-        const std::int32_t entry = sequence.kv->text.page_ids()[page];
-        if (paged_kv_is_cold(entry)) { continue; }
-        const std::int32_t slot = decoder->text_kv.allocate_cold_slot();
-        if (slot < 0) { break; }
-        const std::int32_t physical = entry;
-        const std::int32_t kv_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
-        for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
-            const Tensor cold_slots = decoder->text_kv.cold_slots(layer);
-            const Tensor cold_valid = decoder->text_kv.cold_slot_valid(layer);
-            auto* k_codes = static_cast<const std::uint8_t*>(view.k_pages.data) +
-                            physical * view.k_pages.nb[3];
-            auto* v_codes = static_cast<const std::uint8_t*>(view.v_pages.data) +
-                            physical * view.v_pages.nb[3];
-            auto* k_scales = static_cast<const std::uint8_t*>(view.k_scale_pages.data) +
-                             physical * view.k_scale_pages.nb[3];
-            auto* v_scales = static_cast<const std::uint8_t*>(view.v_scale_pages.data) +
-                             physical * view.v_scale_pages.nb[3];
-            auto* k_slot = static_cast<std::uint8_t*>(cold_slots.data) +
-                           static_cast<std::int64_t>(slot) * cold_slots.nb[3];
-            auto* v_slot = k_slot + cold_slots.nb[2];
-            auto* k_valid = static_cast<std::int32_t*>(cold_valid.data) +
-                            static_cast<std::int64_t>(slot) * cold_valid.nb[2];
-            auto* v_valid = reinterpret_cast<std::int32_t*>(
-                reinterpret_cast<std::uint8_t*>(k_valid) + cold_valid.nb[1]);
-            const bool int8_layer = view.dtype == DType::I8;
-            const auto mode = int8_layer ? ops::EntropyColdRequantMode::Int8G64
-                                         : ops::EntropyColdRequantMode::Nvfp4G16;
-            ops::entropy_cold_requant_raw(
-                k_codes, k_scales, mode, kv_heads, 1,
-                static_cast<std::uint8_t*>(cold_requant_codes),
-                static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
-            ops::cold_i8_slot_pack_raw(
-                static_cast<const std::uint8_t*>(cold_requant_codes),
-                static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
-                k_valid, device.stream);
-            const auto vmode = int8_layer ? ops::EntropyColdRequantMode::Int8G64
-                                          : ops::EntropyColdRequantMode::Iso3VG16;
-            ops::entropy_cold_requant_raw(
-                v_codes, v_scales, vmode, kv_heads, 1,
-                static_cast<std::uint8_t*>(cold_requant_codes),
-                static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
-            ops::cold_i8_slot_pack_raw(
-                static_cast<const std::uint8_t*>(cold_requant_codes),
-                static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
-                v_valid, device.stream);
-        }
-        candidates.push_back({page, slot});
-    }
-    if (candidates.empty()) { return; }
-
-    CUDA_CHECK(cudaStreamSynchronize(device.stream));
-    std::vector<std::int32_t> k_flags(
-        static_cast<std::size_t>(decoder->text_kv.batch_layer_view(0).num_kv_heads));
-    std::vector<std::int32_t> v_flags(k_flags.size());
-    const int kv_heads = static_cast<int>(k_flags.size());
-    std::size_t compressed = 0;
-    for (const Candidate& candidate : candidates) {
-        const Tensor cold_valid = decoder->text_kv.cold_slot_valid(0);
-        auto* k_valid = static_cast<std::int32_t*>(cold_valid.data) +
-                        static_cast<std::int64_t>(candidate.slot) * cold_valid.nb[2];
-        auto* v_valid = reinterpret_cast<std::int32_t*>(
-            reinterpret_cast<std::uint8_t*>(k_valid) + cold_valid.nb[1]);
-        CUDA_CHECK(cudaMemcpy(k_flags.data(), k_valid, k_flags.size() * sizeof(std::int32_t),
-                              cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(v_flags.data(), v_valid, v_flags.size() * sizeof(std::int32_t),
-                              cudaMemcpyDeviceToHost));
-        const bool success =
-            std::all_of(k_flags.begin(), k_flags.end(), [](std::int32_t v) { return v != 0; }) &&
-            std::all_of(v_flags.begin(), v_flags.end(), [](std::int32_t v) { return v != 0; });
-        if (success) {
-            sequence.kv->text.compress_page(candidate.page, candidate.slot, device.stream);
-        } else {
-            decoder->text_kv.release_cold_slot(candidate.slot);
-        }
-        compressed += success ? 1 : 0;
-    }
-    std::fprintf(stderr, "[cold] pages %zu compressed / %zu candidates\n",
-                 compressed, candidates.size());
-}
 
 
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
@@ -11638,12 +11518,6 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
                             std::span<const runtime::RoundBudget> budgets,
                             runtime::ExecutionTiming* failed_timing) {
-    // Cold-pool maintenance: opportunistically compress eligible pages at the
-    // round boundary (window policy only, host policy offloads elsewhere).
-    if (cold_policy == ColdPolicy::Window && lanes.size() == 1 &&
-        sequences[lanes[0]].kv) {
-        enqueue_cold_compressions(sequences[lanes[0]]);
-    }
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing);
     }
