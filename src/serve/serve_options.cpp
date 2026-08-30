@@ -279,6 +279,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--yarn") {
+            options.yarn_enabled = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
