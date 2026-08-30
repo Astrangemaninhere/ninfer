@@ -46,6 +46,7 @@ struct ServeOptions {
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
+    bool yarn_enabled       = false;
     bool allow_prefix_reuse = true;
     ColdPolicy cold_policy        = ColdPolicy::None;
     std::uint32_t cold_keep_tokens = 128;
