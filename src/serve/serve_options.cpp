@@ -77,6 +77,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N] "
+           "[--cold-policy none|window|host] [--cold-keep-tokens N] "
+           "[--cold-host-bytes N[g|m|k]] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -258,6 +260,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--cold-policy") {
+            const std::string_view v = require_value("--cold-policy");
+            if (v == "none" || v == "off") { options.cold_policy = ColdPolicy::None; }
+            else if (v == "window") { options.cold_policy = ColdPolicy::Window; }
+            else if (v == "host") { options.cold_policy = ColdPolicy::Host; }
+            else { throw std::invalid_argument("invalid cold-policy: " + std::string(v)); }
+        } else if (arg == "--cold-keep-tokens") {
+            options.cold_keep_tokens =
+                parse_u64(require_value("--cold-keep-tokens"), "cold-keep-tokens");
+            if (options.cold_keep_tokens > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--cold-keep-tokens is out of range");
+            }
+        } else if (arg == "--cold-host-bytes") {
+            options.cold_host_bytes =
+                parse_u64(require_value("--cold-host-bytes"), "cold-host-bytes");
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

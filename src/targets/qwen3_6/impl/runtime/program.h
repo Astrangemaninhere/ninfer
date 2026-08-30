@@ -709,6 +709,8 @@ public:
     std::uint32_t cold_requant_heads = 0;
     void enqueue_cold_compressions(SequenceState& sequence);
     void warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page);
+    void restore_cold_page(SequenceState& sequence, std::uint32_t page, std::int32_t slot,
+                           const DeviceKVPageHandle& physical);
 
     std::size_t vision_handoff_peak_bytes    = 0;
 
