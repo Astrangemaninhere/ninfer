@@ -106,6 +106,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    ColdPolicy cold_policy      = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;

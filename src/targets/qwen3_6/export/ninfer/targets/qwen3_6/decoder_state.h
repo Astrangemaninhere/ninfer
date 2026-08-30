@@ -56,11 +56,6 @@ public:
     [[nodiscard]] bool valid() const noexcept { return cache_ != nullptr; }
 
     [[nodiscard]] std::uint32_t max_context() const noexcept;
-    // Cold-slot pool: fixed raw slots per (layer, kv_head, plane).
-    [[nodiscard]] std::int32_t cold_slot_bytes() const noexcept { return cold_slot_bytes_; }
-    [[nodiscard]] std::uint32_t max_cold_pages() const noexcept { return max_cold_pages_; }
-    std::int32_t allocate_cold_slot() noexcept;
-    void release_cold_slot(std::int32_t slot) noexcept;
 
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer) const;
 
@@ -81,7 +76,13 @@ public:
     PagedKVCache(PagedKVCache&&)                 = delete;
     PagedKVCache& operator=(PagedKVCache&&)      = delete;
 
-    [[nodiscard]] std::uint32_t max_context() const noexcept { return max_context_; }
+        // Cold-slot pool: fixed raw slots per (layer, kv_head, plane).
+    [[nodiscard]] std::int32_t cold_slot_bytes() const noexcept { return cold_slot_bytes_; }
+    [[nodiscard]] std::uint32_t max_cold_pages() const noexcept { return max_cold_pages_; }
+    std::int32_t allocate_cold_slot() noexcept;
+    void release_cold_slot(std::int32_t slot) noexcept;
+
+[[nodiscard]] std::uint32_t max_context() const noexcept { return max_context_; }
 
     [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
 
@@ -99,6 +100,10 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
+    [[nodiscard]] Tensor cold_slot_valid(std::uint32_t layer) const noexcept {
+        return layer < layers_ ? cold_slot_valid_[layer] : Tensor{};
+    }
+
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
@@ -108,6 +113,7 @@ private:
     std::uint32_t layers_      = 0;
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;
+
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
     std::array<Tensor, 16> cold_slots_;

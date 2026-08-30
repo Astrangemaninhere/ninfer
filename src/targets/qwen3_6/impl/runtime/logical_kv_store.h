@@ -760,6 +760,49 @@ public:
         release_descriptor(handle, page);
     }
 
+    // Cold-pool transfer: detach the page's device replica (returning the
+    // physical page to the pool) while keeping the descriptor, so the address
+    // membership and its block-table slot stay stable. The page's contents
+    // live in a fixed cold slot; restore_from_cold brings them back on demand.
+    void transfer_to_cold(LogicalKVPageHandle handle, DeviceKVPageReservation& reservation) {
+        Page& page = require(handle);
+        if (page.references != 1 || page.writer_references != 1 || page.source_pins != 0 ||
+            page.destination_pinned || page.host_replica || !page.device_replica ||
+            page.cold_compressed) {
+            throw std::logic_error("logical KV page is not cold-transferable");
+        }
+        physical_->dematerialize_one(reservation, std::move(*page.device_replica));
+        page.device_replica.reset();
+        page.cold_compressed = true;
+    }
+
+    [[nodiscard]] bool cold_compressed(LogicalKVPageHandle handle) const noexcept {
+        return valid(handle) && pages_[handle.index_].cold_compressed;
+    }
+
+    // Cold-pool restore: allocate a fresh physical page for a cold descriptor
+    // and hand it back so the caller can repopulate it from the cold slot.
+    // The descriptor keeps its membership position and reference counts.
+    [[nodiscard]] DeviceKVPageHandle restore_from_cold(LogicalKVPageHandle handle,
+                                                       DeviceKVPageReservation& reservation) {
+        Page& page = require(handle);
+        if (!page.cold_compressed) {
+            throw std::logic_error("logical KV page is not cold");
+        }
+        if (reservation.pages() == 0) {
+            if (!physical_->can_resize_reservation(reservation, 1)) {
+                throw std::logic_error("Paged KV pool has no capacity for a cold restore");
+            }
+            physical_->resize_reservation(reservation, 1);
+        }
+        DeviceKVPageLease lease  = physical_->materialize_one(reservation);
+        DeviceKVPageHandle lease_handle = lease.handle();
+        page.device_replica.emplace(std::move(lease));
+        page.cold_compressed = false;
+        page.content_epoch   = next_epoch(page.content_epoch);
+        return lease_handle;
+    }
+
     [[nodiscard]] bool release(LogicalKVPageHandle handle) noexcept {
         if (!valid(handle)) { return false; }
         Page& page = pages_[handle.index_];
@@ -778,6 +821,7 @@ private:
         std::uint8_t writer_references  = 0;
         bool destination_pinned         = false;
         bool occupied                   = false;
+        bool cold_compressed            = false;
         std::optional<DeviceKVPageLease> device_replica;
         std::optional<DeviceKVPageLease> pending_device_replica;
         std::optional<HostKVPageReplica> host_replica;
@@ -1646,6 +1690,46 @@ public:
             throw std::out_of_range("KV logical page is outside the address space");
         }
         return pages_->physical(membership(address, logical_page));
+    }
+
+    // Cold-pool accessors: the window maintenance path detaches retired pages
+    // into fixed cold slots (transfer_to_cold + sentinel block-table entries)
+    // and restores them on demand (restore_from_cold + physical page publish).
+    [[nodiscard]] bool cold_compressed(KVAddressSpaceHandle handle,
+                                       std::uint32_t logical_page) const {
+        const Address& address = require(handle);
+        if (logical_page >= address.page_count) {
+            throw std::out_of_range("KV cold page is outside the address space");
+        }
+        return pages_->cold_compressed(membership(address, logical_page));
+    }
+
+    // Whether the page may be detached into a cold slot right now: not already
+    // cold, exclusively referenced by its writer, and free of pins/fork ties.
+    [[nodiscard]] bool can_cold_transfer(KVAddressSpaceHandle handle,
+                                         std::uint32_t logical_page) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Address& address = addresses_[handle.index_];
+        if (logical_page >= address.page_count) { return false; }
+        const LogicalKVPageHandle& logical = membership(address, logical_page);
+        return !pages_->cold_compressed(logical) && pages_->can_dematerialize(logical);
+    }
+
+    void transfer_to_cold(KVAddressSpaceHandle handle, std::uint32_t logical_page) {
+        Address& address = require_active(handle);
+        if (logical_page >= address.page_count) {
+            throw std::out_of_range("KV cold transfer is outside the address space");
+        }
+        pages_->transfer_to_cold(membership(address, logical_page), address.reservation);
+    }
+
+    [[nodiscard]] DeviceKVPageHandle restore_from_cold(KVAddressSpaceHandle handle,
+                                                       std::uint32_t logical_page) {
+        Address& address = require_active(handle);
+        if (logical_page >= address.page_count) {
+            throw std::out_of_range("KV cold restore is outside the address space");
+        }
+        return pages_->restore_from_cold(membership(address, logical_page), address.reservation);
     }
 
     [[nodiscard]] std::uint64_t content_epoch(KVAddressSpaceHandle handle,

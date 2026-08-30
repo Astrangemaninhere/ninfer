@@ -80,12 +80,14 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     const std::int32_t cold_slot_bytes = ops::kColdI8SlotBytes;
     if (spec.max_cold_pages != 0) {
         const std::uint32_t cold_pages = spec.max_cold_pages;
+        layout.text_kv.cold_slot_bytes = cold_slot_bytes;
+        layout.text_kv.max_cold_pages  = spec.max_cold_pages;
         for (std::uint32_t layer = 0; layer < spec.full_attention_layers; ++layer) {
-            layout.cold_slots[layer] = builder.add_tensor(
+            layout.text_kv.cold_slots[layer] = builder.add_tensor(
                 DType::U8, {cold_slot_bytes, static_cast<std::uint32_t>(spec.kv_heads),
                              2, cold_pages},
                 256, "cold slots L" + std::to_string(layer));
-            layout.cold_slot_valid[layer] = builder.add_tensor(
+            layout.text_kv.cold_slot_valid[layer] = builder.add_tensor(
                 DType::I32, {static_cast<std::uint32_t>(spec.kv_heads), 2, cold_pages}, 256,
                 "cold slot valid L" + std::to_string(layer));
         }
@@ -154,6 +156,9 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .k_scale_pages = scaled ? pages_.plane(base + 2) : Tensor(),
         .v_scale_pages = scaled ? pages_.plane(base + 3) : Tensor(),
         .block_table   = block_table,
+        .cold_slots    = cold_slots_[layer],
+        .cold_slot_valid = cold_slot_valid_[layer],
+        .cold_slot_bytes = cold_slot_bytes_,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,
@@ -174,6 +179,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .block_tables  = execution_tables_.matrix(),
         .cold_slots    = cold_slots_[layer],
         .cold_slot_valid = cold_slot_valid_[layer],
+        .cold_slot_bytes = cold_slot_bytes_,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,

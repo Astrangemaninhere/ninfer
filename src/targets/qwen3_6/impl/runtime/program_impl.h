@@ -21,6 +21,7 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -812,6 +813,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    if (cold_policy == ColdPolicy::Window) {
+        const std::int32_t requant_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
+        if (requant_heads > 0) {
+            CUDA_CHECK(cudaMalloc(&cold_requant_codes,
+                                  8192ULL * static_cast<std::uint64_t>(requant_heads)));
+            CUDA_CHECK(cudaMalloc(&cold_requant_scales,
+                                  1024ULL * static_cast<std::uint64_t>(requant_heads)));
+            cold_requant_heads = static_cast<std::uint32_t>(requant_heads);
+        }
+    }
     text_host_kv_page_stride =
         plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
@@ -986,6 +997,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (cold_requant_codes != nullptr) {
+        (void)cudaFree(cold_requant_codes);
+        (void)cudaFree(cold_requant_scales);
+        cold_requant_codes  = nullptr;
+        cold_requant_scales = nullptr;
+    }
 }
 
 std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
@@ -9153,6 +9170,15 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 transaction.shared_source_index < shared_prefix_capacity &&
                 shared_prefix_slots[transaction.shared_source_index].role ==
                     SharedPrefixSlotRole::Catalogued;
+            // A retained source may carry cold-pool pages: warm them back into
+            // physical pages before any prefix fork touches the membership.
+            if (private_source_ready && cold_policy == ColdPolicy::Window) {
+                SequenceState& source = continuation_states[transaction.source_index];
+                if (source.kv && source.kv->text.valid() &&
+                    text_kv_addresses->active(source.kv->text)) {
+                    warm_cold_prefix(source, source.text_kv_valid);
+                }
+            }
             if (private_source_ready == shared_source_ready ||
                 transaction.reserved_state_count != state_slots || state_slots == 0 ||
                 !transaction.root_text_address || !transaction.text_prefix_fork ||
@@ -10195,6 +10221,12 @@ void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
     }
     if (text_kv_addresses) { (void)text_kv_addresses->release(sequence.kv->text); }
     sequence.kv.reset();
+    if (decoder != nullptr) {
+        for (const auto& cold : sequence.cold_pages) {
+            decoder->text_kv.release_cold_slot(cold.slot);
+        }
+    }
+    sequence.cold_pages.clear();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }
 
@@ -10241,48 +10273,55 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 }
 
 
-// Cold-pool maintenance: pack the retired tail of a sequence's text KV into
+// Cold-pool maintenance: pack the retired prefix of a sequence's text KV into
 // raw entropy slots and detach those pages (sentinel entries in the block
 // table; physical pages return to the pool). Runs when the window policy is
-// active and at least cold_keep_tokens lie behind the decode frontier.
+// active and at least cold_keep_tokens lie behind the decode frontier. The
+// decode kernels read cold pages straight from the slots, so no restore is
+// needed on the steady-state path.
 void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
     if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
-        !sequence.kv->text.valid()) {
+        !sequence.kv->text.valid() || cold_requant_codes == nullptr) {
         return;
     }
     KVAddressSpaceStore& store = *text_kv_addresses;
     KVAddressSpaceHandle text  = sequence.kv->text;
-    const std::uint32_t total_pages = store.entitlement(text);
+    const std::uint32_t total_pages = store.mapped_pages(text);
     if (total_pages == 0) { return; }
 
     const std::uint32_t cold_pages =
         sequence.text_kv_valid > cold_keep_tokens
             ? (sequence.text_kv_valid - cold_keep_tokens) / kPagedKVPageSize
             : 0;
-    if (cold_pages == 0 || cold_pages >= total_pages) { return; }
+    const std::uint32_t limit = cold_pages < total_pages ? cold_pages : total_pages;
+    if (limit == 0) { return; }
 
-    // Allocate cold slots for the tail (one slot per page; shared across heads
-    // through the flat slot addressing in the kernels).
-    const std::int32_t slot = decoder->text_kv.allocate_cold_slot();
-    if (slot < 0) { return; }
+    const std::int32_t kv_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
+    const std::uint32_t layers  = decoder->text_kv.layers();
+    // Cold slots carry requantized E2M1 planes (int8 -> E2M1 g64). The page
+    // stays hot unless every layer can pack, so mixed-dtype stacks skip.
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        if (decoder->text_kv.batch_layer_view(layer).dtype != DType::I8) { return; }
+    }
+    std::vector<std::int32_t> k_flags(static_cast<std::size_t>(kv_heads));
+    std::vector<std::int32_t> v_flags(static_cast<std::size_t>(kv_heads));
+    std::uint32_t compressed = 0;
 
-    const std::uint32_t keep_pages = total_pages - cold_pages;
-    const std::int32_t kv_heads =
-        decoder->text_kv.batch_layer_view(0).num_kv_heads;
+    for (std::uint32_t page = sequence.cold_frontier; page < limit; ++page) {
+        if (!store.can_cold_transfer(text, page)) { continue; }
+        const std::int32_t slot = decoder->text_kv.allocate_cold_slot();
+        if (slot < 0) { break; }  // cold pool exhausted: keep the rest hot.
 
-    // Pack every layer's cold tail pages into the raw slots.
-    for (std::uint32_t layer = 0; layer < decoder->text_kv.layers(); ++layer) {
-        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
-        const Tensor cold_slots = view.cold_slots;
-        if (cold_slots.data == nullptr) { continue; }
-        const bool int8_layer = view.dtype == DType::I8;
-        const auto k_mode = int8_layer ? ops::EntropyColdRequantMode::Int8G64
-                                       : ops::EntropyColdRequantMode::Nvfp4G16;
-        const auto v_mode = int8_layer ? ops::EntropyColdRequantMode::Int8G64
-                                       : ops::EntropyColdRequantMode::Iso3VG16;
-        for (std::uint32_t p = 0; p < cold_pages; ++p) {
-            const DeviceKVPageHandle ph = store.physical_page(text, keep_pages + p);
-            if (!ph.valid()) { continue; }
+        bool success = true;
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+            const Tensor cold_slots          = view.cold_slots;
+            if (cold_slots.data == nullptr) { continue; }
+            if (view.dtype != DType::I8) {
+                success = false;  // cold slots only carry int8 planes
+                break;
+            }
+            const DeviceKVPageHandle ph = store.physical_page(text, page);
             const std::int32_t physical = ph.index();
             auto* k_codes = static_cast<const std::uint8_t*>(view.k_pages.data) +
                             physical * view.k_pages.nb[3];
@@ -10292,16 +10331,15 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                              physical * view.k_scale_pages.nb[3];
             auto* v_scales = static_cast<const std::uint8_t*>(view.v_scale_pages.data) +
                              physical * view.v_scale_pages.nb[3];
-            const std::int64_t slot_off =
-                (static_cast<std::int64_t>(slot) * 2 * kv_heads) * cold_slots.nb[0];
-            auto* k_slot = static_cast<std::uint8_t*>(cold_slots.data) + slot_off;
+            auto* k_slot = static_cast<std::uint8_t*>(cold_slots.data) +
+                           static_cast<std::int64_t>(slot) * cold_slots.nb[3];
             auto* v_slot = k_slot + cold_slots.nb[2];
             auto* k_valid = static_cast<std::int32_t*>(view.cold_slot_valid.data) +
                             static_cast<std::int64_t>(slot) * view.cold_slot_valid.nb[2];
             auto* v_valid = reinterpret_cast<std::int32_t*>(
                 reinterpret_cast<std::uint8_t*>(k_valid) + view.cold_slot_valid.nb[1]);
             ops::entropy_cold_requant_raw(
-                k_codes, k_scales, k_mode, kv_heads, 1,
+                k_codes, k_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
                 static_cast<std::uint8_t*>(cold_requant_codes),
                 static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
             ops::cold_i8_slot_pack_raw(
@@ -10309,7 +10347,7 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                 static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
                 k_valid, device.stream);
             ops::entropy_cold_requant_raw(
-                v_codes, v_scales, v_mode, kv_heads, 1,
+                v_codes, v_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
                 static_cast<std::uint8_t*>(cold_requant_codes),
                 static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
             ops::cold_i8_slot_pack_raw(
@@ -10317,20 +10355,110 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                 static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
                 v_valid, device.stream);
         }
-    }
-    device.synchronize();
+        if (!success) {
+            decoder->text_kv.release_cold_slot(slot);
+            continue;
+        }
+        device.synchronize();
 
-    // Detach the tail: shrink the address space, return the physical pages,
-    // and publish sentinel entries in the execution row.
-    const KVExecutionRowLease& row = store.execution_row(text);
-    std::vector<std::int32_t> sentinel(cold_pages, paged_kv_cold_entry(slot));
-    decoder->text_kv.execution_tables().publish_indices(
-        row.handle(), keep_pages, sentinel, device.stream);
-    store.deactivate(text);
-    (void)store.activate(text, keep_pages, static_cast<std::int32_t>(row.index()));
-    device.synchronize();
-    std::fprintf(stderr, "[cold] compressed tail %u pages -> slot %d (kept %u)\n",
-                 cold_pages, slot, keep_pages);
+        // A slot only counts once every head's pack kernel committed its valid
+        // flag; otherwise the page would decode as garbage through the slot.
+        const Tensor cold_valid = decoder->text_kv.cold_slot_valid(0);
+        auto* k_valid = static_cast<std::int32_t*>(cold_valid.data) +
+                        static_cast<std::int64_t>(slot) * cold_valid.nb[2];
+        auto* v_valid = reinterpret_cast<std::int32_t*>(
+            reinterpret_cast<std::uint8_t*>(k_valid) + cold_valid.nb[1]);
+        CUDA_CHECK(cudaMemcpy(k_flags.data(), k_valid,
+                              k_flags.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(v_flags.data(), v_valid,
+                              v_flags.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+        const bool valid =
+            std::all_of(k_flags.begin(), k_flags.end(),
+                        [](std::int32_t value) { return value != 0; }) &&
+            std::all_of(v_flags.begin(), v_flags.end(),
+                        [](std::int32_t value) { return value != 0; });
+        if (!valid) {
+            decoder->text_kv.release_cold_slot(slot);
+            continue;
+        }
+
+        // Publish the sentinel and return the physical page to the pool.
+        const std::int32_t entry = paged_kv_cold_entry(slot);
+        decoder->text_kv.execution_tables().publish_indices(
+            store.execution_row(text).handle(), page, std::span<const std::int32_t>(&entry, 1),
+            device.stream);
+        store.transfer_to_cold(text, page);
+        sequence.cold_pages.emplace_back(page, slot);
+        sequence.cold_frontier = page + 1;
+        ++compressed;
+    }
+    if (compressed != 0) {
+        device.synchronize();
+        std::fprintf(stderr, "[cold] compressed %u prefix pages (kept %u+)\n", compressed,
+                     cold_keep_tokens);
+    }
+}
+
+// Warm-restore the cold prefix of a sequence (rewrite/resume paths only): the
+// steady-state decode path reads cold pages directly from their slots, but a
+// rewrite needs real physical pages so append/fork can mutate them again.
+void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page) {
+    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
+        cold_requant_codes == nullptr || sequence.cold_pages.empty()) {
+        return;
+    }
+    KVAddressSpaceStore& store = *text_kv_addresses;
+    KVAddressSpaceHandle text  = sequence.kv->text;
+    const std::uint32_t mapped = store.mapped_pages(text);
+    const std::uint32_t pages  = std::min(end_page, mapped);
+    if (pages == 0) { return; }
+
+    const int kv_heads          = decoder->text_kv.batch_layer_view(0).num_kv_heads;
+    const std::uint32_t layers  = decoder->text_kv.layers();
+    std::uint32_t restored      = 0;
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        if (!store.cold_compressed(text, page)) { continue; }
+        auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
+                                  [page](const SequenceState::ColdPageEntry& e) {
+                                      return e.page == page;
+                                  });
+        if (entry == sequence.cold_pages.end()) { continue; }
+        const std::int32_t slot = entry->slot;
+        const DeviceKVPageHandle physical = store.restore_from_cold(text, page);
+        const std::int32_t ph_index      = physical.index();
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+            const Tensor cold_slots          = view.cold_slots;
+            if (cold_slots.data == nullptr || view.dtype != DType::I8) { continue; }
+            auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
+            auto* v_slot_base = k_slot_base + cold_slots.nb[2];
+            auto* k_codes_i8 = static_cast<std::int8_t*>(view.k_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
+            auto* v_codes_i8 = static_cast<std::int8_t*>(view.v_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
+            auto* k_scales_h = static_cast<void*>(
+                static_cast<std::uint8_t*>(view.k_scale_pages.data) +
+                static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3]);
+            auto* v_scales_h = static_cast<void*>(
+                static_cast<std::uint8_t*>(view.v_scale_pages.data) +
+                static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3]);
+            ops::cold_i8_slot_restore_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                          k_codes_i8, k_scales_h, device.stream);
+            ops::cold_i8_slot_restore_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                          v_codes_i8, v_scales_h, device.stream);
+        }
+        decoder->text_kv.execution_tables().publish_indices(
+            store.execution_row(text).handle(), page,
+            std::span<const std::int32_t>(&ph_index, 1), device.stream);
+        decoder->text_kv.release_cold_slot(slot);
+        sequence.cold_pages.erase(entry);
+        ++restored;
+    }
+    if (restored != 0) {
+        sequence.cold_frontier = 0;  // pages are hot again; rescan from the front
+        device.synchronize();
+        std::fprintf(stderr, "[cold] restored %u prefix pages\n", restored);
+    }
 }
 
 void ProgramImplCore::prepare_graphs() {
@@ -11614,9 +11742,11 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
                             std::span<const runtime::RoundBudget> budgets,
                             runtime::ExecutionTiming* failed_timing) {
     // Cold-pool maintenance at the round boundary (window policy only).
-    if (cold_policy == ColdPolicy::Window && lanes.size() == 1 &&
-        sequences[lanes[0]].kv) {
-        enqueue_cold_compressions(sequences[lanes[0]]);
+    if (cold_policy == ColdPolicy::Window && lanes.size() == 1) {
+        SequenceState& sequence = active_sequence(lanes[0]);
+        if (sequence.kv) {
+            enqueue_cold_compressions(sequence);
+        }
     }
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing);

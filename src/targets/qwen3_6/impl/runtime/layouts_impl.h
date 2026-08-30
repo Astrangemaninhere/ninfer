@@ -137,12 +137,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
                      .enable_mtp                = plan.features.mtp(),
-                     .max_cold_pages            = plan.cold_policy == ColdPolicy::Window
-                                                          ? plan.cold_keep_tokens / kPagedKVPageSize + 16
-                                                          : 0,
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
+                     .max_cold_pages            = plan.cold_policy == ColdPolicy::Window
+                                                          ? plan.cold_keep_tokens / kPagedKVPageSize + 16
+                                                          : 0,
                  });
     qwen3_6::StateImageSpec state_image_spec{
         .linear =
@@ -751,10 +751,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
+        .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .cold_policy         = options.cold_policy,
         .cold_keep_tokens    = options.cold_keep_tokens,
         .cold_host_bytes     = options.cold_host_bytes,
-        .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
         .context_cache       = options.context_cache,
     };
