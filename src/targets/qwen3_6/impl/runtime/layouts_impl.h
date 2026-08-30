@@ -602,7 +602,13 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
-    const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    // An explicit --kv-capacity may floor the device page pool below max_context
+    // (YaRN extends the rope domain beyond the pool; the cold pool recycles pages).
+    std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
+        minimum_pages = std::max(page_count(options.kv_capacity.explicit_tokens),
+                                 options.max_concurrency);
+    }
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
@@ -610,8 +616,8 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
-            throw std::invalid_argument("kv_capacity must be at least max_context");
+        if (options.kv_capacity.explicit_tokens == 0) {
+            throw std::invalid_argument("kv_capacity must be positive");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
         if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
