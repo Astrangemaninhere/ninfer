@@ -586,8 +586,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 }
 
 void validate_target_options(DeviceContext& device, const EngineOptions& options) {
-    if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
-        throw std::invalid_argument("max_context exceeds the variant native context capacity");
+    // Static YaRN factor-4 extends the rope domain to 4x the native context.
+    const std::uint32_t context_limit =
+        options.yarn_enabled ? 4ULL * Variant::maximum_context : Variant::maximum_context;
+    if (options.max_context == 0 || options.max_context > context_limit) {
+        throw std::invalid_argument(
+            options.yarn_enabled
+                ? "max_context exceeds the variant YaRN-extended context capacity"
+                : "max_context exceeds the variant native context capacity");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");

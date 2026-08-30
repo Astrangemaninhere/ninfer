@@ -161,7 +161,7 @@ void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVL
                        std::int32_t tokens, const char* op) {
     const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeysYarn ||
         envelope.max_visible_keys > capacity) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope");
     }
@@ -242,7 +242,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeysYarn ||
         envelope.max_visible_keys > capacity ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(width)) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope or table");
@@ -361,7 +361,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     if (!supported_dtype || batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
         max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeysYarn ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(max_width)) {
         throw std::invalid_argument(
             "causal_softmax_attention workspace: invalid profile or interval");
