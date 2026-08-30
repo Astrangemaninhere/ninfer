@@ -18,8 +18,9 @@ constexpr int kLargeBlockWaveCapacity = 1020;
 
 template <RopeKernelMode Mode>
 inline constexpr bool kTextMode =
-    Mode == RopeKernelMode::Text1D || Mode == RopeKernelMode::TextMrope ||
-    Mode == RopeKernelMode::DflashText1D;
+    Mode == RopeKernelMode::Text1D || Mode == RopeKernelMode::Text1DYarn4 ||
+    Mode == RopeKernelMode::TextMrope || Mode == RopeKernelMode::DflashText1D ||
+    Mode == RopeKernelMode::DflashText1DYarn4;
 
 std::int64_t token_stride(const Tensor* tensor) {
     return tensor == nullptr ? 0 : tensor->nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
@@ -193,6 +194,61 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
                         cudaStream_t stream) {
     if (!launch_fixed_single_dispatch(positions, rotary_dim, theta, x, stream)) {
         launch_generic(positions, rotary_dim, theta, &x, nullptr, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Static YaRN factor-4 rope: the same fixed geometry as the native modes but
+// with the yarn4 frequency tables and the yarn4 attention scaling folded into
+// the sincos coefficients. Text is D256/R64 (24Q/4K or 16Q/2K), DFlash is
+// D128/R128 (32Q/8K).
+void rope_yarn4_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
+                       cudaStream_t stream) {
+    if (!bf16x2_aligned(q) || !bf16x2_aligned(k)) {
+        throw std::invalid_argument("rope_yarn4: q/k must be bf16x2 aligned");
+    }
+    const int axes = positions.ne[1];
+    if (rotary_dim == 128 && theta == 1.0e7F && axes == 1 && q.ne[0] == 128 && q.ne[1] == 32 &&
+        k.ne[1] == 8) {
+        launch_fixed<RopeKernelMode::DflashText1DYarn4, 32, 8>(positions, &q, &k, stream);
+    } else if (rotary_dim == 64 && theta == 1.0e7F) {
+        if (q.ne[1] == 24 && k.ne[1] == 4) {
+            launch_fixed<RopeKernelMode::Text1DYarn4, 24, 4>(positions, &q, &k, stream);
+        } else if (q.ne[1] == 16 && k.ne[1] == 2) {
+            launch_fixed<RopeKernelMode::Text1DYarn4, 16, 2>(positions, &q, &k, stream);
+        } else {
+            throw std::invalid_argument("rope_yarn4: unsupported Text head geometry");
+        }
+    } else {
+        throw std::invalid_argument("rope_yarn4: expected Text D256/R64 or DFlash D128/R128");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void rope_yarn4_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
+                              cudaStream_t stream) {
+    if (!bf16x2_aligned(x)) {
+        throw std::invalid_argument("rope_yarn4: tensor must be bf16x2 aligned");
+    }
+    const int axes = positions.ne[1];
+    if (rotary_dim == 128 && theta == 1.0e7F && axes == 1 && x.ne[0] == 128) {
+        if (x.ne[1] == 32) {
+            launch_fixed_single<RopeKernelMode::DflashText1DYarn4, 32>(positions, x, stream);
+        } else if (x.ne[1] == 8) {
+            launch_fixed_single<RopeKernelMode::DflashText1DYarn4, 8>(positions, x, stream);
+        } else {
+            throw std::invalid_argument("rope_yarn4: unsupported DFlash head count");
+        }
+    } else if (rotary_dim == 64 && theta == 1.0e7F) {
+        if (x.ne[1] == 24 || x.ne[1] == 4) {
+            launch_fixed_single<RopeKernelMode::Text1DYarn4, 24>(positions, x, stream);
+        } else if (x.ne[1] == 16 || x.ne[1] == 2) {
+            launch_fixed_single<RopeKernelMode::Text1DYarn4, 16>(positions, x, stream);
+        } else {
+            throw std::invalid_argument("rope_yarn4: unsupported Text head count");
+        }
+    } else {
+        throw std::invalid_argument("rope_yarn4: expected Text D256/R64 or DFlash D128/R128");
     }
     CUDA_CHECK(cudaGetLastError());
 }
