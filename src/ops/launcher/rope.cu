@@ -5,6 +5,7 @@
 #include "ops/kernel/rope.cuh"
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
