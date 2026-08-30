@@ -1,4 +1,5 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
+#include "ninfer/ops/cold_i8.h"
 
 #include <limits>
 #include <stdexcept>
@@ -74,16 +75,57 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups);
     }
+    // Entropy-coded cold pool: fixed raw slots (9232 B) plus an I32 validity
+    // plane, per full-attention layer. Only active when the spec opts in.
+    const std::int32_t cold_slot_bytes = ops::kColdI8SlotBytes;
+    if (spec.max_cold_pages != 0) {
+        const std::uint32_t cold_pages = spec.max_cold_pages;
+        for (std::uint32_t layer = 0; layer < spec.full_attention_layers; ++layer) {
+            layout.cold_slots[layer] = builder.add_tensor(
+                DType::U8, {cold_slot_bytes, static_cast<std::uint32_t>(spec.kv_heads),
+                             2, cold_pages},
+                256, "cold slots L" + std::to_string(layer));
+            layout.cold_slot_valid[layer] = builder.add_tensor(
+                DType::I32, {static_cast<std::uint32_t>(spec.kv_heads), 2, cold_pages}, 256,
+                "cold slot valid L" + std::to_string(layer));
+        }
+    }
     return layout;
 }
 
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
-      head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group) {}
+      head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group),
+      cold_slot_bytes_(layout.cold_slot_bytes), max_cold_pages_(layout.max_cold_pages) {
+    cold_slot_used_.assign(max_cold_pages_, 0);
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        if (layout.cold_slots[layer].region.bytes != 0) {
+            cold_slots_[layer] = layout.cold_slots[layer].bind(backing);
+            cold_slot_valid_[layer] = layout.cold_slot_valid[layer].bind(backing);
+        }
+    }
+}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
+
+std::int32_t PagedKVCache::allocate_cold_slot() noexcept {
+    if (max_cold_pages_ == 0) { return -1; }
+    for (std::uint32_t slot = 0; slot < max_cold_pages_; ++slot) {
+        if (!cold_slot_used_[slot]) {
+            cold_slot_used_[slot] = true;
+            return static_cast<std::int32_t>(slot);
+        }
+    }
+    return -1;
+}
+
+void PagedKVCache::release_cold_slot(std::int32_t slot) noexcept {
+    if (slot >= 0 && static_cast<std::uint32_t>(slot) < max_cold_pages_) {
+        cold_slot_used_[slot] = false;
+    }
+}
 
 std::uint32_t PagedKVCacheView::max_context() const noexcept {
     return cache_ == nullptr ? 0 : cache_->max_context();
@@ -130,6 +172,8 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .k_scale_pages = scaled ? pages_.plane(base + 2) : Tensor(),
         .v_scale_pages = scaled ? pages_.plane(base + 3) : Tensor(),
         .block_tables  = execution_tables_.matrix(),
+        .cold_slots    = cold_slots_[layer],
+        .cold_slot_valid = cold_slot_valid_[layer],
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,

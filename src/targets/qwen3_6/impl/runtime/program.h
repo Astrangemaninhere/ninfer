@@ -695,6 +695,15 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
 
+    // Cold-pool maintenance (rev 2b): staging + per-step compress pass.
+    ColdPolicy cold_policy      = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    void* cold_requant_codes       = nullptr;
+    void* cold_requant_scales      = nullptr;
+    std::uint32_t cold_requant_heads = 0;
+    void enqueue_cold_compressions(SequenceState& sequence);
+
     std::size_t vision_handoff_peak_bytes    = 0;
 
 private:
