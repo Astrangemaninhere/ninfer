@@ -136,6 +136,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
+                     .layer_kv_dtypes           = plan.layer_kv_dtypes,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
@@ -733,6 +734,25 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     validate_target_options(device, options);
     const TargetKVCacheProfile kv_profile = target_kv_cache_profile(options.kv_cache);
 
+    std::array<DType, 16> layer_overrides{};
+    const bool has_override = options.kv_layer_storage_explicit;
+    if (has_override) {
+        for (std::size_t i = 0; i < layer_overrides.size(); ++i) {
+            const auto v = options.kv_layer_storage[i];
+            layer_overrides[i] = v == KvCacheStorage::BFloat16
+                                     ? DType::BF16
+                                     : (v == KvCacheStorage::Int8Group64
+                                            ? DType::I8
+                                            : (v == KvCacheStorage::Nvfp4Group16
+                                                   ? DType::NVFP4
+                                                   : (v == KvCacheStorage::Fp8Group16
+                                                          ? DType::FP8_E4M3FN
+                                                          : DType::BF16)));
+        }
+    } else if constexpr (Variant::supports_per_layer_kv_defaults) {
+        layer_overrides = Variant::default_layer_kv_dtypes(
+            weights_profile);
+    }
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -742,6 +762,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .speculative_backend = options.speculative.backend,
         .kv_dtype            = kv_profile.dtype,
         .kv_quant_group      = kv_profile.quant_group,
+        .layer_kv_dtypes     = layer_overrides,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,

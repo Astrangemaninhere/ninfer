@@ -15,6 +15,8 @@ using GraphExecutionProfile = qwen3_6::GraphExecutionProfile;
 // Compile-time data and the three closed execution leaves supplied to the Qwen3.6 family runtime.
 // It owns no request state, execution phase, graph object, or schedule callback.
 struct Variant {
+    static constexpr bool supports_per_layer_kv_defaults    = true;
+    [[nodiscard]] static std::array<DType, 16> default_layer_kv_dtypes(WeightsProfile profile);
     using WeightsProfile                 = detail::WeightsProfile;
     using TextConfig                     = detail::TextConfig;
     using VisionConfig                   = detail::VisionConfig;
