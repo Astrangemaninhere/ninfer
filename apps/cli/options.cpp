@@ -222,8 +222,8 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
-        options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        options.kv_capacity.explicit_tokens == 0) {
+        throw std::invalid_argument("--kv-capacity must be positive");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
