@@ -27,10 +27,8 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
-    ColdPolicy cold_policy         = ColdPolicy::None;
-    std::uint32_t cold_keep_tokens = 128;
-    std::uint64_t cold_host_bytes  = 4ULL << 30;
-    bool yarn_enabled              = false;
+    std::string kv_layer_storage_spec;
+    bool kv_layer_storage_explicit = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;
