@@ -33,6 +33,7 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    static constexpr bool supports_per_layer_kv_defaults    = false;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>

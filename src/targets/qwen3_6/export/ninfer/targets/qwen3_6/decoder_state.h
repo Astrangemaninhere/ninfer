@@ -11,6 +11,7 @@ namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvInt8QuantGroup = 64;
 inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
+inline constexpr std::int32_t kNvfp4KvQuantGroup = 16;
 
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
@@ -20,6 +21,9 @@ struct DecoderStateSpec {
     std::int32_t attention_head_dim         = 0;
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
+    // Per-layer storage table indexed by full-attention layer order.
+    // BFloat16 entries inherit kv_dtype; empty (all-BF16) inherits wholesale.
+    std::array<DType, 16> layer_kv_dtypes{};
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -37,12 +41,8 @@ struct PagedKVCacheLayout {
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
-    // Cold slots per layer: [slot_bytes, kv_heads, 2, max_cold_pages]
-    // plus an I32 validity plane of [kv_heads, 2, max_cold_pages].
-    std::array<TensorRegion, 16> cold_slots;
-    std::array<TensorRegion, 16> cold_slot_valid;
-    std::int32_t cold_slot_bytes = 0;
-    std::uint32_t max_cold_pages = 0;
+    // Resolved per-layer storage (one entry per full-attention layer).
+    std::array<DType, 16> layer_dtypes{};
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -116,11 +116,7 @@ private:
 
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
-    std::array<Tensor, 16> cold_slots_;
-    std::array<Tensor, 16> cold_slot_valid_;
-    std::int32_t cold_slot_bytes_ = 0;
-    std::uint32_t max_cold_pages_ = 0;
-    std::vector<std::uint8_t> cold_slot_used_;
+    std::array<DType, 16> layer_dtypes_{};
     std::int32_t quant_group_  = 0;
 };
 
