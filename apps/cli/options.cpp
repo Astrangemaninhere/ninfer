@@ -85,6 +85,8 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--cold-policy none|off|window|host] [--cold-keep-tokens N]\n"
+           "       [--cold-host-bytes N[g|m|k]]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -152,6 +154,17 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--cold-policy") {
+            const std::string v = value(arg);
+            if (v == "none" || v == "off") { options.cold_policy = ColdPolicy::None; }
+            else if (v == "window") { options.cold_policy = ColdPolicy::Window; }
+            else if (v == "host") { options.cold_policy = ColdPolicy::Host; }
+            else { throw std::invalid_argument("invalid cold-policy: " + v); }
+            options.cold_keep_tokens = 128;
+        } else if (arg == "--cold-keep-tokens") {
+            options.cold_keep_tokens = parse_u32(value(arg), "cold-keep-tokens");
+        } else if (arg == "--cold-host-bytes") {
+            options.cold_host_bytes = parse_u32(value(arg), "cold-host-bytes");
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {
