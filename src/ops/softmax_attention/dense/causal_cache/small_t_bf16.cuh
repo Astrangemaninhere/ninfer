@@ -9,6 +9,7 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 
+#include "ops/kernel/cold_i8_kernels.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 
 #include <cstdint>
@@ -22,6 +23,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+    const std::uint8_t* cold_slots, const std::int32_t* cold_valid, std::int32_t cold_slot_bytes,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
@@ -217,6 +219,15 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
+        // A Bc=32 tile never crosses a 64-token page boundary, so the entry
+        // cached for this tile decides the whole tile's load path. Cold pages
+        // carry a sentinel (<= -2): decode E2M1 nibbles + E4M3 g16 scales
+        // straight from the raw slot into the bf16 tile.
+        const int entry = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+        const bool cold = entry <= -2 && cold_slots != nullptr && cold_slot_bytes >= 1024 + 320 &&
+                          cold_valid[(-entry - 2) * (2 * Geometry::KVHeads) + kv_head] != 0 &&
+                          cold_valid[(-entry - 2) * (2 * Geometry::KVHeads) + Geometry::KVHeads +
+                                     kv_head] != 0;
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
         // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #pragma unroll 1
@@ -236,11 +247,81 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                             kv_cache_int8_new_index<Geometry>(kv_head, d, new_token);
                         ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
                         ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                    } else if (cold) {
+                        const int slot_base = -entry - 2;
+                        const std::int64_t k_off =
+                            static_cast<std::int64_t>(slot_base * (2 * Geometry::KVHeads) +
+                                                      kv_head) *
+                            cold_slot_bytes;
+                        const std::int64_t v_off = k_off + static_cast<std::int64_t>(
+                                                                Geometry::KVHeads) *
+                                                                cold_slot_bytes;
+                        const std::uint8_t* k_row = detail::cold_i8_slot_codes(cold_slots + k_off) +
+                                                    (key & kPagedKVPageMask) * 128;
+                        const std::uint8_t* k_row_s =
+                            detail::cold_i8_slot_scales(cold_slots + k_off) +
+                            (key & kPagedKVPageMask) * 16;
+                        const std::uint8_t* v_row = detail::cold_i8_slot_codes(cold_slots + v_off) +
+                                                    (key & kPagedKVPageMask) * 128;
+                        const std::uint8_t* v_row_s =
+                            detail::cold_i8_slot_scales(cold_slots + v_off) +
+                            (key & kPagedKVPageMask) * 16;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const int chan     = d + i;
+                            const std::uint8_t kb = k_row[chan >> 1];
+                            const std::uint8_t vb = v_row[chan >> 1];
+                            const float k_code =
+                                gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (kb >> 4) : (kb & 0x0F));
+                            const float v_code =
+                                gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (vb >> 4) : (vb & 0x0F));
+                            const float k_scale =
+                                gqa_kv_nvfp4_e4m3_to_f32(k_row_s[chan >> 4]);
+                            const float v_scale =
+                                gqa_kv_nvfp4_e4m3_to_f32(v_row_s[chan >> 4]);
+                            k_dst[i] = __float2bfloat16(k_code * k_scale);
+                            v_dst[i] = __float2bfloat16(v_code * v_scale);
+                        }
                     } else {
                         const std::int64_t off = causal_cache_index<Geometry>(
                             physical_page, kv_head, d, key & kPagedKVPageMask);
                         ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                         ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                    }
+                } else if (cold) {
+                    const int slot_base = -entry - 2;
+                    const std::int64_t k_off =
+                        static_cast<std::int64_t>(slot_base * (2 * Geometry::KVHeads) +
+                                                  kv_head) *
+                        cold_slot_bytes;
+                    const std::int64_t v_off = k_off + static_cast<std::int64_t>(
+                                                            Geometry::KVHeads) *
+                                                            cold_slot_bytes;
+                    const std::uint8_t* k_row = detail::cold_i8_slot_codes(cold_slots + k_off) +
+                                                (key & kPagedKVPageMask) * 128;
+                    const std::uint8_t* k_row_s =
+                        detail::cold_i8_slot_scales(cold_slots + k_off) +
+                        (key & kPagedKVPageMask) * 16;
+                    const std::uint8_t* v_row = detail::cold_i8_slot_codes(cold_slots + v_off) +
+                                                (key & kPagedKVPageMask) * 128;
+                    const std::uint8_t* v_row_s =
+                        detail::cold_i8_slot_scales(cold_slots + v_off) +
+                        (key & kPagedKVPageMask) * 16;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int chan     = d + i;
+                        const std::uint8_t kb = k_row[chan >> 1];
+                        const std::uint8_t vb = v_row[chan >> 1];
+                        const float k_code =
+                            gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (kb >> 4) : (kb & 0x0F));
+                        const float v_code =
+                            gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (vb >> 4) : (vb & 0x0F));
+                        const float k_scale =
+                            gqa_kv_nvfp4_e4m3_to_f32(k_row_s[chan >> 4]);
+                        const float v_scale =
+                            gqa_kv_nvfp4_e4m3_to_f32(v_row_s[chan >> 4]);
+                        k_dst[i] = __float2bfloat16(k_code * k_scale);
+                        v_dst[i] = __float2bfloat16(v_code * v_scale);
                     }
                 } else {
                     const std::int64_t off = causal_cache_index<Geometry>(physical_page, kv_head, d,

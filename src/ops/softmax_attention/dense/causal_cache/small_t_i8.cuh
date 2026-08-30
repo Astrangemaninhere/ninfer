@@ -22,6 +22,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "ops/kernel/cold_i8_kernels.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 
@@ -62,6 +63,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+        const std::uint8_t* cold_slots, const std::int32_t* cold_valid, std::int32_t cold_slot_bytes,
         __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
@@ -357,6 +359,99 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float l0 = 0.0f, l1 = 0.0f;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        // A Bc=32 tile never crosses a 64-token page boundary. Cold pages
+        // carry a sentinel (<= -2): decode E2M1 nibbles + E4M3 g16 scales
+        // from the raw slot back into int8 codes + fp16 g64 scales, matching
+        // the native planes the hot path stages with cp.async.
+        const int entry = physical_pages_s[(tile_k0 >> kPagedKVPageShift) - first_page];
+        const bool cold = entry <= -2 && cold_slots != nullptr && cold_slot_bytes >= 1024 + 320 &&
+                          cold_valid[(-entry - 2) * (2 * Geometry::KVHeads) + kv_head] != 0 &&
+                          cold_valid[(-entry - 2) * (2 * Geometry::KVHeads) + Geometry::KVHeads +
+                                     kv_head] != 0;
+        if (cold) {
+            const int slot_base = -entry - 2;
+            const std::int64_t k_off =
+                static_cast<std::int64_t>(slot_base * (2 * Geometry::KVHeads) + kv_head) *
+                cold_slot_bytes;
+            const std::int64_t v_off =
+                k_off + static_cast<std::int64_t>(Geometry::KVHeads) * cold_slot_bytes;
+            for (int key_l = tid; key_l < Bc; key_l += Threads) {
+                const int key = tile_k0 + key_l;
+                if (key >= split_start && key < split_end) {
+                    const int row              = key & kPagedKVPageMask;
+                    const std::uint8_t* k_rs =
+                        detail::cold_i8_slot_scales(cold_slots + k_off) + row * 16;
+                    const std::uint8_t* v_rs =
+                        detail::cold_i8_slot_scales(cold_slots + v_off) + row * 16;
+#pragma unroll
+                    for (int g = 0; g < Groups; ++g) {
+                        float mk = 0.0f, mv = 0.0f;
+#pragma unroll
+                        for (int s = 0; s < 4; ++s) {
+                            mk = fmaxf(mk, gqa_kv_nvfp4_e4m3_to_f32(k_rs[g * 4 + s]));
+                            mv = fmaxf(mv, gqa_kv_nvfp4_e4m3_to_f32(v_rs[g * 4 + s]));
+                        }
+                        k_scale_s[key_l * Groups + g] = __float2half(mk * 6.0f / 127.0f);
+                        v_scale_s[key_l * Groups + g] = __float2half(mv * 6.0f / 127.0f);
+                    }
+                } else {
+                    store_vec(&k_scale_s[key_l * Groups], make_int2(0, 0));
+                    store_vec(&v_scale_s[key_l * Groups], make_int2(0, 0));
+                }
+            }
+#pragma unroll 1
+            for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+                const int key_l = chunk / (D / 16);
+                const int dc    = chunk - key_l * (D / 16);
+                const int d     = dc * 16;
+                const int key   = tile_k0 + key_l;
+                std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
+                if (key >= split_start && key < split_end) {
+                    const int row = key & kPagedKVPageMask;
+                    const std::uint8_t* k_rc =
+                        detail::cold_i8_slot_codes(cold_slots + k_off) + row * 128;
+                    const std::uint8_t* k_rs =
+                        detail::cold_i8_slot_scales(cold_slots + k_off) + row * 16;
+                    const std::uint8_t* v_rc =
+                        detail::cold_i8_slot_codes(cold_slots + v_off) + row * 128;
+                    const std::uint8_t* v_rs =
+                        detail::cold_i8_slot_scales(cold_slots + v_off) + row * 16;
+                    // 16 channels never straddle a 64-channel group, so each
+                    // chunk recomputes its own upper-bound group scale.
+                    const int g = d >> 6;
+                    float mk = 0.0f, mv = 0.0f;
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        mk = fmaxf(mk, gqa_kv_nvfp4_e4m3_to_f32(k_rs[g * 4 + s]));
+                        mv = fmaxf(mv, gqa_kv_nvfp4_e4m3_to_f32(v_rs[g * 4 + s]));
+                    }
+                    const float k_inv = mk > 0.0f ? 127.0f / (mk * 6.0f) : 0.0f;
+                    const float v_inv = mv > 0.0f ? 127.0f / (mv * 6.0f) : 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        const int chan = d + i;
+                        const std::uint8_t kb = k_rc[chan >> 1];
+                        const std::uint8_t vb = v_rc[chan >> 1];
+                        const float k_code =
+                            gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (kb >> 4) : (kb & 0x0F));
+                        const float v_code =
+                            gqa_kv_nvfp4_e2m1_to_f32((chan & 1) ? (vb >> 4) : (vb & 0x0F));
+                        const float k_scale = gqa_kv_nvfp4_e4m3_to_f32(k_rs[chan >> 4]);
+                        const float v_scale = gqa_kv_nvfp4_e4m3_to_f32(v_rs[chan >> 4]);
+                        int kc = __float2int_rn(k_code * k_scale * k_inv);
+                        int vc = __float2int_rn(v_code * v_scale * v_inv);
+                        kc    = max(-127, min(127, kc));
+                        vc    = max(-127, min(127, vc));
+                        dst[i] = static_cast<std::int8_t>(kc);
+                        v_i8[key_l * D + chan] = static_cast<std::int8_t>(vc);
+                    }
+                } else {
+                    store_vec(dst, make_int4(0, 0, 0, 0));
+                    store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                }
+            }
+            return;
+        }
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
