@@ -135,7 +135,10 @@ Options parse_options(int argc, char** argv) {
             options.device = parse_device(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
-        } else if (arg == "--spec") {
+                } else if (arg == "--kv-layer-storage") {
+            options.kv_layer_storage_spec = value(arg);
+            options.kv_layer_storage_explicit = true;
+} else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
