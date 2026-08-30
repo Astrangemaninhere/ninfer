@@ -20,7 +20,20 @@
 
 #include "ops/kernel/gqa_attention_kv_nvfp4.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
-#include "ops/kernel/gqa_attention_prefill_nvfp4.cuh" // gqa_iso3_nibble / gqa_iso3_decode
+// ISO3 = sign-magnitude INT3: low 3 bits magnitude 0..7, bit 3 sign.
+// Inlined here to keep the op header dependency-free.
+__device__ __forceinline__ std::uint8_t gqa_iso3_nibble(float value, float scale) {
+    float mag = roundf(fabsf(value) / scale);
+    if (mag > 7.0f) { mag = 7.0f; }
+    if (mag < 0.0f) { mag = 0.0f; }
+    std::uint8_t code = static_cast<std::uint8_t>(mag);
+    if (value < 0.0f && code != 0) { code |= 0x08u; }
+    return code;
+}
+__device__ __forceinline__ float gqa_iso3_decode(std::uint8_t code) {
+    const float mag = static_cast<float>(code & 0x07u);
+    return (code & 0x08u) != 0 ? -mag : mag;
+}
 #include "ops/launcher/entropy_cold_requant.h"
 
 #include <cuda_runtime.h>
