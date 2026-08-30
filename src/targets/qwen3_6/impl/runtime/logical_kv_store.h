@@ -764,16 +764,30 @@ public:
     // physical page to the pool) while keeping the descriptor, so the address
     // membership and its block-table slot stay stable. The page's contents
     // live in a fixed cold slot; restore_from_cold brings them back on demand.
+    // An existing host replica is deliberately KEPT: the checkpoint restore
+    // path (prepare_kv_restores) needs a restorable source, and the host copy
+    // predates the cold requant, so it doubles as the higher-fidelity backup.
     void transfer_to_cold(LogicalKVPageHandle handle, DeviceKVPageReservation& reservation) {
         Page& page = require(handle);
-        if (page.references != 1 || page.writer_references != 1 || page.source_pins != 0 ||
-            page.destination_pinned || page.host_replica || !page.device_replica ||
-            page.cold_compressed) {
+        if (page.source_pins != 0 || page.destination_pinned || !page.device_replica ||
+            page.cold_compressed || page.writer_references != 0 || page.references == 0) {
             throw std::logic_error("logical KV page is not cold-transferable");
         }
         physical_->dematerialize_one(reservation, std::move(*page.device_replica));
         page.device_replica.reset();
         page.cold_compressed = true;
+    }
+
+    // Like can_dematerialize but for the cold pool: committed history pages
+    // (writer_references == 0) qualify, host replicas do not block (the
+    // transfer drops them), and catalogued/fork references are fine because
+    // the fork path warms cold pages before materializing them.
+    [[nodiscard]] bool can_cold_transfer(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Page& page = pages_[handle.index_];
+        return page.references != 0 && page.writer_references == 0 && page.source_pins == 0 &&
+               !page.destination_pinned && page.device_replica.has_value() &&
+               !page.cold_compressed;
     }
 
     [[nodiscard]] bool cold_compressed(LogicalKVPageHandle handle) const noexcept {
@@ -782,7 +796,9 @@ public:
 
     // Cold-pool restore: allocate a fresh physical page for a cold descriptor
     // and hand it back so the caller can repopulate it from the cold slot.
-    // The descriptor keeps its membership position and reference counts.
+    // The descriptor keeps its membership position and reference counts. Any
+    // host replica is stale after the cold restore (the device copy is now
+    // authoritative) and is dropped; the offload path re-attaches it later.
     [[nodiscard]] DeviceKVPageHandle restore_from_cold(LogicalKVPageHandle handle,
                                                        DeviceKVPageReservation& reservation) {
         Page& page = require(handle);
@@ -800,6 +816,7 @@ public:
         page.device_replica.emplace(std::move(lease));
         page.cold_compressed = false;
         page.content_epoch   = next_epoch(page.content_epoch);
+        page.host_replica.reset();
         return lease_handle;
     }
 
@@ -1706,13 +1723,14 @@ public:
 
     // Whether the page may be detached into a cold slot right now: not already
     // cold, exclusively referenced by its writer, and free of pins/fork ties.
+    // Host replicas do not block (transfer_to_cold drops them).
     [[nodiscard]] bool can_cold_transfer(KVAddressSpaceHandle handle,
                                          std::uint32_t logical_page) const noexcept {
         if (!valid(handle)) { return false; }
         const Address& address = addresses_[handle.index_];
         if (logical_page >= address.page_count) { return false; }
         const LogicalKVPageHandle& logical = membership(address, logical_page);
-        return !pages_->cold_compressed(logical) && pages_->can_dematerialize(logical);
+        return pages_->can_cold_transfer(logical);
     }
 
     void transfer_to_cold(KVAddressSpaceHandle handle, std::uint32_t logical_page) {

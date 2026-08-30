@@ -1960,6 +1960,9 @@ ProgramImplCore::checkpoint_restore_requirements(const SequenceKVBundle& kv,
         for (std::uint32_t page = 0; page < required; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.device_resident(logical)) { continue; }
+            // Cold-pool pages restore in place from their raw slots; they
+            // need no host transfer.
+            if (pages.cold_compressed(logical)) { continue; }
             if (!pages.host_resident(logical)) {
                 throw std::logic_error("checkpoint KV page has no restorable replica");
             }
@@ -4825,6 +4828,25 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             for (std::uint32_t page = 0; page < mapped; ++page) {
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 if (pages.device_resident(logical)) { continue; }
+                if (pages.cold_compressed(logical)) {
+                    // Cold-pool page: its restorable source is the raw cold
+                    // slot, not a host replica. Restore synchronously here
+                    // (same reservation); the activation publish
+                    // (publish_membership) republishes the physical mapping.
+                    if (source_state == nullptr) {
+                        throw std::logic_error("cold checkpoint page has no source bookkeeping");
+                    }
+                    auto entry = std::find_if(
+                        source_state->cold_pages.begin(), source_state->cold_pages.end(),
+                        [page](const SequenceState::ColdPageEntry& e) { return e.page == page; });
+                    if (entry == source_state->cold_pages.end()) {
+                        throw std::logic_error("cold checkpoint page has no slot record");
+                    }
+                    const DeviceKVPageHandle restored =
+                        pages.restore_from_cold(logical, reservation);
+                    restore_cold_page(*source_state, page, entry->slot, restored);
+                    continue;
+                }
                 if (!pages.host_resident(logical) || !host_kv_extents) {
                     throw std::logic_error("checkpoint KV page has no restorable replica");
                 }
@@ -10399,6 +10421,44 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
     }
 }
 
+// Restore one cold page's data from its raw slot into the physical page and
+// release the slot. Shared by the rewrite warm path and the checkpoint
+// restore path (which must repopulate cold pages without a host replica).
+void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t page,
+                                        std::int32_t slot, const DeviceKVPageHandle& physical) {
+    const int kv_heads          = decoder->text_kv.batch_layer_view(0).num_kv_heads;
+    const std::uint32_t layers  = decoder->text_kv.layers();
+    const std::int32_t ph_index = physical.index();
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+        const Tensor cold_slots          = view.cold_slots;
+        if (cold_slots.data == nullptr || view.dtype != DType::I8) { continue; }
+        auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
+        auto* v_slot_base = k_slot_base + cold_slots.nb[2];
+        auto* k_codes_i8 = static_cast<std::int8_t*>(view.k_pages.data) +
+                           static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
+        auto* v_codes_i8 = static_cast<std::int8_t*>(view.v_pages.data) +
+                           static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
+        auto* k_scales_h = static_cast<void*>(
+            static_cast<std::uint8_t*>(view.k_scale_pages.data) +
+            static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3]);
+        auto* v_scales_h = static_cast<void*>(
+            static_cast<std::uint8_t*>(view.v_scale_pages.data) +
+            static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3]);
+        ops::cold_i8_slot_restore_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                      k_codes_i8, k_scales_h, device.stream);
+        ops::cold_i8_slot_restore_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                      v_codes_i8, v_scales_h, device.stream);
+    }
+    decoder->text_kv.release_cold_slot(slot);
+    auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
+                              [page](const SequenceState::ColdPageEntry& e) {
+                                  return e.page == page;
+                              });
+    if (entry != sequence.cold_pages.end()) { sequence.cold_pages.erase(entry); }
+    sequence.cold_frontier = 0;  // pages are hot again; rescan from the front
+}
+
 // Warm-restore the cold prefix of a sequence (rewrite/resume paths only): the
 // steady-state decode path reads cold pages directly from their slots, but a
 // rewrite needs real physical pages so append/fork can mutate them again.
@@ -10413,9 +10473,7 @@ void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t en
     const std::uint32_t pages  = std::min(end_page, mapped);
     if (pages == 0) { return; }
 
-    const int kv_heads          = decoder->text_kv.batch_layer_view(0).num_kv_heads;
-    const std::uint32_t layers  = decoder->text_kv.layers();
-    std::uint32_t restored      = 0;
+    std::uint32_t restored = 0;
     for (std::uint32_t page = 0; page < pages; ++page) {
         if (!store.cold_compressed(text, page)) { continue; }
         auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
@@ -10423,39 +10481,15 @@ void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t en
                                       return e.page == page;
                                   });
         if (entry == sequence.cold_pages.end()) { continue; }
-        const std::int32_t slot = entry->slot;
         const DeviceKVPageHandle physical = store.restore_from_cold(text, page);
         const std::int32_t ph_index      = physical.index();
-        for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
-            const Tensor cold_slots          = view.cold_slots;
-            if (cold_slots.data == nullptr || view.dtype != DType::I8) { continue; }
-            auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
-            auto* v_slot_base = k_slot_base + cold_slots.nb[2];
-            auto* k_codes_i8 = static_cast<std::int8_t*>(view.k_pages.data) +
-                               static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
-            auto* v_codes_i8 = static_cast<std::int8_t*>(view.v_pages.data) +
-                               static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
-            auto* k_scales_h = static_cast<void*>(
-                static_cast<std::uint8_t*>(view.k_scale_pages.data) +
-                static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3]);
-            auto* v_scales_h = static_cast<void*>(
-                static_cast<std::uint8_t*>(view.v_scale_pages.data) +
-                static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3]);
-            ops::cold_i8_slot_restore_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
-                                          k_codes_i8, k_scales_h, device.stream);
-            ops::cold_i8_slot_restore_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
-                                          v_codes_i8, v_scales_h, device.stream);
-        }
+        restore_cold_page(sequence, page, entry->slot, physical);
         decoder->text_kv.execution_tables().publish_indices(
             store.execution_row(text).handle(), page,
             std::span<const std::int32_t>(&ph_index, 1), device.stream);
-        decoder->text_kv.release_cold_slot(slot);
-        sequence.cold_pages.erase(entry);
         ++restored;
     }
     if (restored != 0) {
-        sequence.cold_frontier = 0;  // pages are hot again; rescan from the front
         device.synchronize();
         std::fprintf(stderr, "[cold] restored %u prefix pages\n", restored);
     }
@@ -11742,10 +11776,14 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
                             std::span<const runtime::RoundBudget> budgets,
                             runtime::ExecutionTiming* failed_timing) {
     // Cold-pool maintenance at the round boundary (window policy only).
-    if (cold_policy == ColdPolicy::Window && lanes.size() == 1) {
-        SequenceState& sequence = active_sequence(lanes[0]);
-        if (sequence.kv) {
-            enqueue_cold_compressions(sequence);
+    // Every active sequence maintains its own retired prefix; multi-lane
+    // batches compress each lane's pages independently.
+    if (cold_policy == ColdPolicy::Window) {
+        for (const std::uint32_t lane : lanes) {
+            SequenceState& sequence = active_sequence(lane);
+            if (sequence.kv) {
+                enqueue_cold_compressions(sequence);
+            }
         }
     }
     if (speculative_backend == SpeculativeBackend::None) {

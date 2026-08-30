@@ -47,6 +47,9 @@ struct ServeOptions {
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
+    ColdPolicy cold_policy        = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
