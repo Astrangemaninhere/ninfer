@@ -210,7 +210,8 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
     // per-layer table (PR1) can mix quantized and BF16 layers in one pool.
     const DType layer_dtype =
         layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer];
-    const bool scaled        = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN;
+    const bool scaled = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN ||
+                        layer_dtype == DType::NVFP4;
     const std::size_t base   = layer_plane_base_.empty()
                                     ? static_cast<std::size_t>(layer) * (scaled ? 4ULL : 2ULL)
                                     : layer_plane_base_[layer];
@@ -253,7 +254,8 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
     // per-layer table (PR1) can mix quantized and BF16 layers in one pool.
     const DType layer_dtype =
         layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer];
-    const bool scaled        = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN;
+    const bool scaled = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN ||
+                        layer_dtype == DType::NVFP4;
     const std::size_t base   = layer_plane_base_.empty()
                                     ? static_cast<std::size_t>(layer) * (scaled ? 4ULL : 2ULL)
                                     : layer_plane_base_[layer];
