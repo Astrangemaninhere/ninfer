@@ -538,6 +538,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
                                           last);
     case WeightsProfile::Qwen38Nvfp4: {
+    case WeightsProfile::Qwen38Nvfp4DFlash2:
         const std::size_t nvfp4 =
             post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);
         const std::size_t fp8 = post_mixer_workspace_bytes(
