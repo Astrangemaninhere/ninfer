@@ -37,16 +37,26 @@ struct PagedKVLayerView {
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
+    // NVFP4 tier: optional two-stage residual planes (empty when the layer
+    // runs without residuals) and the separate V storage format.
+    Tensor k_residual_pages;
+    Tensor k_residual_scale_pages;
+    Tensor v_residual_pages;
+    Tensor v_residual_scale_pages;
     Tensor block_table;
     // Entropy-coded cold pool (single-sequence window view): fixed raw slots +
     // validity flags. Empty when the cache has no cold pool.
     Tensor cold_slots;
     Tensor cold_slot_valid;
-    std::int32_t cold_slot_bytes = 0;
+    std::int32_t slot_bytes = 0;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
+    std::int32_t layer_index  = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    DType v_dtype             = DType::BF16;
+    std::int32_t v_quant_group = 0;
+    std::uint32_t sliding_window_tokens = 0;
     std::array<DType, 16> layer_dtypes{};
 };
 
@@ -56,15 +66,23 @@ struct PagedKVBatchLayerView {
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
+    Tensor k_residual_pages;
+    Tensor k_residual_scale_pages;
+    Tensor v_residual_pages;
+    Tensor v_residual_scale_pages;
     Tensor block_tables;
     // Entropy-coded cold pool: fixed raw slots + validity flags per layer.
     Tensor cold_slots;
     Tensor cold_slot_valid;
-    std::int32_t cold_slot_bytes = 0;
+    std::int32_t slot_bytes = 0;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
+    std::int32_t layer_index  = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    DType v_dtype             = DType::BF16;
+    std::int32_t v_quant_group = 0;
+    std::uint32_t sliding_window_tokens = 0;
 };
 
 // A plane is storage-only. Target code assigns K/V/layer meaning to plane indices.

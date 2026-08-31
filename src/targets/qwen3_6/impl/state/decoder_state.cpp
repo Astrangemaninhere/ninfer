@@ -135,14 +135,14 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     }
     // Entropy-coded cold pool: fixed raw slots (9232 B) plus an I32 validity
     // plane, per full-attention layer. Only active when the spec opts in.
-    const std::int32_t cold_slot_bytes = ops::kColdI8SlotBytes;
+    const std::int32_t slot_bytes = ops::kColdI8SlotBytes;
     if (spec.max_cold_pages != 0) {
         const std::uint32_t cold_pages = spec.max_cold_pages;
-        layout.text_kv.cold_slot_bytes = cold_slot_bytes;
+        layout.text_kv.slot_bytes = slot_bytes;
         layout.text_kv.max_cold_pages  = spec.max_cold_pages;
         for (std::uint32_t layer = 0; layer < spec.full_attention_layers; ++layer) {
             layout.text_kv.cold_slots[layer] = builder.add_tensor(
-                DType::U8, {cold_slot_bytes, static_cast<std::uint32_t>(spec.kv_heads),
+                DType::U8, {slot_bytes, static_cast<std::uint32_t>(spec.kv_heads),
                              2, cold_pages},
                 256, "cold slots L" + std::to_string(layer));
             layout.text_kv.cold_slot_valid[layer] = builder.add_tensor(
@@ -157,7 +157,7 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group),
-      cold_slot_bytes_(layout.cold_slot_bytes), max_cold_pages_(layout.max_cold_pages),
+      slot_bytes_(layout.slot_bytes), max_cold_pages_(layout.max_cold_pages),
       layer_dtypes_(layout.layer_dtypes), layer_plane_base_(layout.layer_plane_base) {
     cold_slot_used_.assign(max_cold_pages_, 0);
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
@@ -222,9 +222,10 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .block_table   = block_table,
         .cold_slots    = cold_slots_[layer],
         .cold_slot_valid = cold_slot_valid_[layer],
-        .cold_slot_bytes = cold_slot_bytes_,
+        .slot_bytes = slot_bytes_,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
+        .layer_index   = static_cast<std::int32_t>(layer),
         .dtype         = layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer],
         .quant_group   = layer_dtypes_.empty()
                              ? quant_group_
@@ -232,7 +233,17 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
                                     ? kKvInt8QuantGroup
                                     : (layer_dtypes_[layer] == DType::FP8_E4M3FN
                                            ? kKvFp8QuantGroup
-                                           : 0)),
+                                           : (layer_dtypes_[layer] == DType::NVFP4
+                                                  ? kNvfp4KvQuantGroup
+                                                  : 0))),
+        .v_dtype       = layer_dtypes_.empty()
+                             ? dtype_
+                             : (layer_dtypes_[layer] == DType::NVFP4 ? DType::ISO3
+                                                                   : layer_dtypes_[layer]),
+        .v_quant_group = layer_dtypes_.empty()
+                             ? quant_group_
+                             : (layer_dtypes_[layer] == DType::NVFP4 ? kNvfp4KvQuantGroup
+                                                                   : 0),
     };
 }
 
@@ -254,9 +265,10 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .block_tables  = execution_tables_.matrix(),
         .cold_slots    = cold_slots_[layer],
         .cold_slot_valid = cold_slot_valid_[layer],
-        .cold_slot_bytes = cold_slot_bytes_,
+        .slot_bytes = slot_bytes_,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
+        .layer_index   = static_cast<std::int32_t>(layer),
         .dtype         = layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer],
         .quant_group   = layer_dtypes_.empty()
                              ? quant_group_
@@ -264,7 +276,17 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
                                     ? kKvInt8QuantGroup
                                     : (layer_dtypes_[layer] == DType::FP8_E4M3FN
                                            ? kKvFp8QuantGroup
-                                           : 0)),
+                                           : (layer_dtypes_[layer] == DType::NVFP4
+                                                  ? kNvfp4KvQuantGroup
+                                                  : 0))),
+        .v_dtype       = layer_dtypes_.empty()
+                             ? dtype_
+                             : (layer_dtypes_[layer] == DType::NVFP4 ? DType::ISO3
+                                                                   : layer_dtypes_[layer]),
+        .v_quant_group = layer_dtypes_.empty()
+                             ? quant_group_
+                             : (layer_dtypes_[layer] == DType::NVFP4 ? kNvfp4KvQuantGroup
+                                                                   : 0),
     };
 }
 

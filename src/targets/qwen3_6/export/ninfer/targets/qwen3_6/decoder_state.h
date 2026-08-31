@@ -45,7 +45,7 @@ struct PagedKVCacheLayout {
     // plus an I32 validity plane of [kv_heads, 2, max_cold_pages].
     std::array<TensorRegion, 16> cold_slots;
     std::array<TensorRegion, 16> cold_slot_valid;
-    std::int32_t cold_slot_bytes = 0;
+    std::int32_t slot_bytes = 0;
     std::uint32_t max_cold_pages = 0;
     // Resolved per-layer storage (one entry per full-attention layer).
     std::array<DType, 16> layer_dtypes{};
@@ -87,7 +87,7 @@ public:
     PagedKVCache& operator=(PagedKVCache&&)      = delete;
 
         // Cold-slot pool: fixed raw slots per (layer, kv_head, plane).
-    [[nodiscard]] std::int32_t cold_slot_bytes() const noexcept { return cold_slot_bytes_; }
+    [[nodiscard]] std::int32_t slot_bytes() const noexcept { return slot_bytes_; }
     [[nodiscard]] std::uint32_t max_cold_pages() const noexcept { return max_cold_pages_; }
     std::int32_t allocate_cold_slot() noexcept;
     void release_cold_slot(std::int32_t slot) noexcept;
@@ -128,7 +128,7 @@ private:
     DType dtype_               = DType::BF16;
     std::array<Tensor, 16> cold_slots_;
     std::array<Tensor, 16> cold_slot_valid_;
-    std::int32_t cold_slot_bytes_ = 0;
+    std::int32_t slot_bytes_ = 0;
     std::uint32_t max_cold_pages_ = 0;
     std::vector<std::uint8_t> cold_slot_used_;
     std::array<DType, 16> layer_dtypes_{};
