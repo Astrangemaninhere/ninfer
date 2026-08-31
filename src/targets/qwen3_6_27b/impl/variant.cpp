@@ -25,10 +25,12 @@ std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
     // extreme outlier (NVFP4 K NMSE ~30x the next layer), and the next five
     // layers dominate the remaining error. Upgrading those to INT8 keeps the
     // long-generation error budget bounded; the rest of the table is NVFP4
-    // (E2M1 K with E4M3 g16 scales, ISO3 V) in the production GQA tier.
+    // (E2M1 K with E4M3 g16 scales, ISO3 V) in the production GQA tier. The
+    // table is NVFP4-major: ten of sixteen layers stay NVFP4 so the device
+    // page pool is roughly 25% smaller than an all-INT8 cache.
     std::array<DType, 16> table{};
     table.fill(DType::NVFP4);
-    for (const int layer : {2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}) {
+    for (const int layer : {5, 6, 7, 8, 9, 14}) {
         table[static_cast<std::size_t>(layer)] = DType::I8;
     }
     return table;
