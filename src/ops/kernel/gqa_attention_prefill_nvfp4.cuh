@@ -995,7 +995,7 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                                             const std::uint8_t* __restrict__ cold_v_slots,
                                             const std::int32_t* __restrict__ cold_k_valid,
                                             const std::int32_t* __restrict__ cold_v_valid,
-                                            int cold_slot_bytes, int sliding_window, int layer,
+                                            int slot_bytes, int sliding_window, int layer,
                                             Metadata metadata,
                                             const std::int32_t* __restrict__ positions, float scale,
                                             __nv_bfloat16* __restrict__ out, std::int32_t width) {
@@ -1204,7 +1204,7 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                                            int half, int k0i) {
             if (ptid < kEntropyNvfp4SlotStreamsPerHalf) {
                 gqa_prefill_nvfp4_cold_decode_kv<Geometry, false>(
-                    k_s, k_slot, entropy_nvfp4_slot_scales(k_slot, cold_slot_bytes), half, k0i,
+                    k_s, k_slot, entropy_nvfp4_slot_scales(k_slot, slot_bytes), half, k0i,
                     visible_start, max_query_abs, ptid);
             }
         };
@@ -1214,26 +1214,24 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
             const int table_entry  = block_table[kb64];
             const bool cold_available = table_entry <= -2 && cold_k_slots != nullptr &&
                                          cold_v_slots != nullptr && cold_k_valid != nullptr &&
-                                         cold_v_valid != nullptr && cold_slot_bytes >= 1024 + 320;
+                                         cold_v_valid != nullptr && slot_bytes >= 1024 + 320;
             const int slot_base    = cold_available ? -table_entry - 2 : 0;
-            // Region-relative flat slot index: slot * 2*KVHeads + head; the V
-            // plane's valid entries sit one KVHeads block later.
-            const int cold_slot_id = slot_base * (2 * Geometry::KVHeads) + kv_head;
+            const int cold_slot_id = slot_base + kv_head;
             const bool cold        = cold_available && cold_k_valid[cold_slot_id] != 0 &&
-                              cold_v_valid[cold_slot_id + Geometry::KVHeads] != 0;
+                              cold_v_valid[cold_slot_id] != 0;
             const int physical_page = cold ? 0 : table_entry;
             const std::uint8_t* k_slot =
-                cold ? cold_k_slots + static_cast<std::int64_t>(cold_slot_id) * cold_slot_bytes
+                cold ? cold_k_slots + static_cast<std::int64_t>(cold_slot_id) * slot_bytes
                      : nullptr;
             const std::uint8_t* v_slot =
-                cold ? cold_v_slots + static_cast<std::int64_t>(cold_slot_id) * cold_slot_bytes
+                cold ? cold_v_slots + static_cast<std::int64_t>(cold_slot_id) * slot_bytes
                      : nullptr;
 
             // ---- half 0 (slot 0) ----
             if constexpr (Mxf4QK) {
                 if (cold) {
                     gqa_prefill_mxf4_stage_k_cold<Geometry, ProducerThreads>(
-                        k_pk0, k_sf0, k_slot, cold_slot_bytes, 0, k0, visible_start,
+                        k_pk0, k_sf0, k_slot, slot_bytes, 0, k0, visible_start,
                         max_query_abs, ptid);
                     for (int chunk = ptid; chunk < Bc * 8; chunk += ProducerThreads) {
                         const int key_l = chunk >> 3;
@@ -1273,7 +1271,7 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                 if (ptid >= kEntropyNvfp4SlotStreamsPerHalf &&
                     ptid < 2 * kEntropyNvfp4SlotStreamsPerHalf) {
                     gqa_prefill_nvfp4_cold_decode_kv<Geometry, VVDType == DType::ISO3>(
-                        v_s0, v_slot, entropy_nvfp4_slot_scales(v_slot, cold_slot_bytes), 0, k0,
+                        v_s0, v_slot, entropy_nvfp4_slot_scales(v_slot, slot_bytes), 0, k0,
                         visible_start, max_query_abs, ptid - kEntropyNvfp4SlotStreamsPerHalf);
                 }
                 gqa_prefill_bar_sync(1, ProducerThreads);
@@ -1286,7 +1284,7 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
             if constexpr (Mxf4QK) {
                 if (cold) {
                     gqa_prefill_mxf4_stage_k_cold<Geometry, ProducerThreads>(
-                        k_pk1, k_sf1, k_slot, cold_slot_bytes, 1, k0 + Bc, visible_start,
+                        k_pk1, k_sf1, k_slot, slot_bytes, 1, k0 + Bc, visible_start,
                         max_query_abs, ptid);
                     for (int chunk = ptid; chunk < Bc * 8; chunk += ProducerThreads) {
                         const int key_l = chunk >> 3;
@@ -1326,7 +1324,7 @@ __launch_bounds__(kNvfp4PrefillThreads, 1) __global__
                 if (ptid >= kEntropyNvfp4SlotStreamsPerHalf &&
                     ptid < 2 * kEntropyNvfp4SlotStreamsPerHalf) {
                     gqa_prefill_nvfp4_cold_decode_kv<Geometry, VVDType == DType::ISO3>(
-                        v_s1, v_slot, entropy_nvfp4_slot_scales(v_slot, cold_slot_bytes), 1,
+                        v_s1, v_slot, entropy_nvfp4_slot_scales(v_slot, slot_bytes), 1,
                         k0 + Bc, visible_start, max_query_abs,
                         ptid - kEntropyNvfp4SlotStreamsPerHalf);
                 }

@@ -69,6 +69,8 @@ add_library(ninfer_ops STATIC
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/dflash2_grouped_conv.cu
+  ops/launcher/gqa_attention_decode.cu
+  ops/launcher/gqa_attention_prefill.cu
   ops/launcher/dflash2_selector.cu
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
@@ -89,6 +91,8 @@ add_library(ninfer_ops STATIC
   ops/launcher/sampling.cu
   ops/launcher/scalar.cu
   ops/launcher/swa.cu
+  ops/kernel/gqa_isoquant_rot.cu
+  ops/kernel/gqa_isoquant_row_scale.cu
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
@@ -248,6 +252,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/dflash2_grouped_conv.cpp
+  ops/wrapper/gqa_attention.cpp
   ops/wrapper/dflash2_selector.cpp
   ops/wrapper/embedding.cpp
   ops/wrapper/cold_i8.cpp
