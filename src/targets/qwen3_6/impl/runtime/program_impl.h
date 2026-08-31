@@ -629,6 +629,19 @@ DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_
     return *it;
 }
 
+// True when no profile of this batch covers the frontier — the caller's cue
+// to extend the family on demand (on-demand graph capture).
+[[nodiscard]] inline bool graph_profile_missing(const DecodeGraphFamily& family,
+                                                std::uint32_t batch_size,
+                                                std::uint32_t frontier) noexcept {
+    return std::none_of(family.profiles.begin(), family.profiles.end(),
+                        [&](const DecodeGraphProfile& profile) {
+                            return profile.batch_size == batch_size &&
+                                   profile.min_execution_frontier <= frontier &&
+                                   frontier <= profile.max_execution_frontier;
+                        });
+}
+
 void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
                              std::uint32_t max_frontier, const char* label) {
     if (profiles.empty() || profiles.front().min != 0 || profiles.back().max != max_frontier) {
@@ -742,6 +755,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       cold_policy(plan.cold_policy), cold_keep_tokens(plan.cold_keep_tokens),
       cold_host_bytes(plan.cold_host_bytes),
+      graph_capture_ceiling(plan.graph_capture_ceiling),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
@@ -10649,6 +10663,18 @@ void ProgramImplCore::prepare_graphs() {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
+        // On-demand capture: with a positive ceiling, startup captures only
+        // the segments fully below it; decode extends on growth crossings and
+        // full coverage is revalidated after each extension.
+        std::vector<GraphExecutionProfile> startup_profiles;
+        if (graph_capture_ceiling == 0) {
+            startup_profiles = ordinary_profiles;
+        } else {
+            for (const GraphExecutionProfile& planned : ordinary_profiles) {
+                if (planned.max <= graph_capture_ceiling) { startup_profiles.push_back(planned); }
+            }
+            if (startup_profiles.empty()) { startup_profiles.push_back(ordinary_profiles.front()); }
+        }
         schedule::OrdinaryBatchContext ordinary_state{
             execution_core(),      decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
@@ -10660,9 +10686,9 @@ void ProgramImplCore::prepare_graphs() {
                                         nullptr);
         device.synchronize();
 
-        ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+        ordinary_graphs.profiles.reserve(startup_profiles.size() * ordinary_batch_limit);
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
-            for (const GraphExecutionProfile planned : ordinary_profiles) {
+            for (const GraphExecutionProfile planned : startup_profiles) {
                 ordinary_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
                 profile.batch_size             = batch_size;
@@ -10676,6 +10702,9 @@ void ProgramImplCore::prepare_graphs() {
                                                         static_cast<std::int32_t>(batch_size),
                                                         envelope, profile.definition);
             }
+        }
+        if (graph_capture_ceiling == 0) {
+            validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         }
     }
 
@@ -10867,7 +10896,75 @@ void ProgramImplCore::prepare_graphs() {
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
 }
 
+schedule::ExecutionCore ProgramImplCore::make_execution_core() {
+    return schedule::ExecutionCore{device,
+                                   model,
+                                   work,
+                                   state_images->linear(),
+                                   replay_records ? &*replay_records : nullptr,
+                                   io,
+                                   prefill_hidden,
+                                   prefill_chunk,
+                                   proposal_head};
+}
 
+// On-demand graph capture: capture the missing ordinary-family segments that
+// cover `frontier` for one batch size. One segment per growth crossing; each
+// is captured exactly once and the family coverage check revalidates. The
+// capture reuses prepare_graphs' dummy-page machinery through the address
+// store: one transient address space on a dedicated execution row whose
+// private page is repeated across the whole table, so arbitrary envelopes
+// read/write valid addresses without disturbing any live request.
+void ProgramImplCore::extend_ordinary_graphs(std::uint32_t batch_size,
+                                             std::uint32_t frontier) {
+    const auto ordinary_profiles = ordinary_graph_profiles(capacity);
+    std::vector<GraphExecutionProfile> missing;
+    for (const GraphExecutionProfile& planned : ordinary_profiles) {
+        const bool covered =
+            std::any_of(ordinary_graphs.profiles.begin(), ordinary_graphs.profiles.end(),
+                        [&](const DecodeGraphProfile& profile) {
+                            return profile.batch_size == batch_size &&
+                                   profile.min_execution_frontier == planned.min &&
+                                   profile.max_execution_frontier == planned.max;
+                        });
+        if (!covered && planned.min <= frontier) { missing.push_back(planned); }
+    }
+    if (missing.empty()) { return; }
+    // Row max_concurrency is the dedicated never-bound capture row (the
+    // address store is sized max_concurrency + 1); request rows 0..C-1 stay
+    // untouched during runtime capture.
+    std::optional<KVAddressSpaceHandle> allocation =
+        text_kv_addresses->create_active(1, static_cast<std::int32_t>(max_concurrency));
+    if (!allocation) { throw std::bad_alloc(); }
+    text_kv_addresses->materialize_to_tokens(*allocation, 1, device.stream);
+    decoder->text_kv.execution_tables().publish_repeated(
+        text_kv_addresses->execution_row(*allocation).handle(),
+        text_kv_addresses->physical_page(*allocation, 0),
+        decoder->text_kv.execution_tables().logical_page_capacity(), device.stream);
+    device.synchronize();
+
+    schedule::OrdinaryBatchContext ordinary_state{
+        make_execution_core(), decoder->text_kv,
+        *io.ordinary,          *ordinary_host_ingress,
+        *ordinary_host_egress, state_images->continuation_hidden_store()};
+    for (const GraphExecutionProfile& planned : missing) {
+        ordinary_graphs.profiles.emplace_back();
+        DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
+        profile.batch_size             = batch_size;
+        profile.min_execution_frontier = planned.min;
+        profile.max_execution_frontier = planned.max;
+        profile.topology_class         = planned.topology_class * max_concurrency + (batch_size - 1U);
+        const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+        schedule::capture_ordinary_decode_batch(ordinary_state,
+                                                static_cast<std::int32_t>(batch_size), envelope,
+                                                profile.definition);
+    }
+    if (text_kv_addresses->active(*allocation)) { text_kv_addresses->deactivate(*allocation); }
+    (void)text_kv_addresses->release(*allocation);
+    std::fprintf(stderr, "[graphs] extended ordinary family: batch %u +%zu segments through "
+                         "frontier %u\n",
+                 batch_size, missing.size(), frontier);
+}
 
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
@@ -11333,6 +11430,16 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
+            // On-demand capture: with a startup ceiling, growth past the
+            // captured segments extends the family once per crossing here.
+            if (graph_capture_ceiling != 0 &&
+                graph_profile_missing(ordinary_graphs,
+                                      static_cast<std::uint32_t>(lanes.size()),
+                                      maximum_frontier)) {
+                (void)cudaStreamSynchronize(device.stream);
+                extend_ordinary_graphs(static_cast<std::uint32_t>(lanes.size()),
+                                       maximum_frontier);
+            }
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");

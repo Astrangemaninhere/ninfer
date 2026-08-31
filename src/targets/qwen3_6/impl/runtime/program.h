@@ -12,6 +12,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
@@ -705,6 +706,7 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
 
+<<<<<<< HEAD
     // Cold-pool maintenance (rev 2b): staging + per-step compress pass.
     ColdPolicy cold_policy      = ColdPolicy::None;
     std::uint32_t cold_keep_tokens = 128;
@@ -717,6 +719,12 @@ public:
     void restore_cold_page(SequenceState& sequence, std::uint32_t page, std::int32_t slot,
                            const DeviceKVPageHandle& physical);
 
+=======
+    // On-demand graph capture state (see DecodeGraphFamily comment).
+    std::uint32_t graph_capture_ceiling = 0;
+    void extend_ordinary_graphs(std::uint32_t batch_size, std::uint32_t frontier);
+    schedule::ExecutionCore make_execution_core();
+>>>>>>> pr4/on-demand-graphs
     std::size_t vision_handoff_peak_bytes    = 0;
 
 private:

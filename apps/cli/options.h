@@ -33,6 +33,7 @@ struct Options {
     bool yarn_enabled              = false;
     std::string kv_layer_storage_spec;
     bool kv_layer_storage_explicit = false;
+    std::uint32_t graph_capture_ceiling = 0;
 
     bool raw_output      = false;
     bool print_token_ids = false;

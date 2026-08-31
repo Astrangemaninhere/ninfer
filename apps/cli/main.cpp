@@ -295,6 +295,7 @@ int main(int argc, char** argv) {
             }
             engine_options.kv_layer_storage_explicit = true;
         }
+        engine_options.graph_capture_ceiling = cli.graph_capture_ceiling;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;
