@@ -70,6 +70,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    Auto,
 };
 
 struct SpeculativeOptions {

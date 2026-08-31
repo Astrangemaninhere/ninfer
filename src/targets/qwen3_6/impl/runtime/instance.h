@@ -16,12 +16,14 @@ using WeightsProfile                 = typename Variant::WeightsProfile;
 using TextConfig                     = typename Variant::TextConfig;
 using VisionConfig                   = typename Variant::VisionConfig;
 using DFlashConfig                   = typename Variant::DFlashConfig;
+using DFlash2Config                  = typename Variant::DFlash2Config;
 using LoadedModelData                = typename Variant::ModelView;
 using FullAttentionWeights           = typename LoadedModelData::FullLayer;
 using GdnWeights                     = typename LoadedModelData::GdnLayer;
 using MlpWeights                     = typename Variant::PostMixerWeights;
 using MtpWeights                     = typename LoadedModelData::MtpLayer;
 using DFlashWeights                  = typename LoadedModelData::DFlash;
+using DFlash2Weights                 = typename LoadedModelData::DFlash2;
 using FullAttentionProjectionWeights = typename Variant::FullAttentionProjectionWeights;
 using GdnProjectionWeights           = typename Variant::GdnProjectionWeights;
 using VisionWeights                  = typename Variant::VisionWeights;
@@ -72,6 +74,12 @@ inline std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t ca
                                                                 std::uint32_t draft_window,
                                                                 std::uint32_t batch_size) {
     return Variant::dflash_graph_profiles(capacity, draft_window, batch_size);
+}
+
+inline std::vector<GraphExecutionProfile> dflash2_graph_profiles(std::uint32_t capacity,
+                                                                std::uint32_t draft_window,
+                                                                std::uint32_t batch_size) {
+    return Variant::dflash2_graph_profiles(capacity, draft_window, batch_size);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

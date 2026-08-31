@@ -655,6 +655,7 @@ public:
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
+    std::optional<DFlash2PersistentState> dflash2;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
@@ -672,6 +673,7 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+    DecodeGraphFamily dflash2_graphs;
 
     PinnedHostBuffer round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -685,6 +687,9 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    std::optional<PinnedHostBuffer> dflash2_host;
+    qwen3_6::DFlashDecodeIngress* dflash2_host_ingress = nullptr;
+    qwen3_6::DFlashDecodeEgress* dflash2_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
@@ -1162,6 +1167,10 @@ private:
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_dflash2_batch(std::span<const std::uint32_t> lanes,
+                         std::span<const runtime::RoundBudget> budgets,
+                         runtime::ExecutionTiming* failed_timing);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);

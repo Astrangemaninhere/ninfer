@@ -123,6 +123,10 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
     }
     return profiles;
 }
+std::vector<GraphExecutionProfile> Variant::dflash2_graph_profiles(std::uint32_t, std::uint32_t, std::uint32_t) {
+    return {};
+}
+
 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
