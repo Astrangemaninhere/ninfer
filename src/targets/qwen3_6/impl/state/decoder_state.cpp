@@ -207,7 +207,13 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .dtype         = layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer],
-        .quant_group   = quant_group_,
+        .quant_group   = layer_dtypes_.empty()
+                             ? quant_group_
+                             : (layer_dtypes_[layer] == DType::I8
+                                    ? kKvInt8QuantGroup
+                                    : (layer_dtypes_[layer] == DType::FP8_E4M3FN
+                                           ? kKvFp8QuantGroup
+                                           : 0)),
     };
 }
 
@@ -228,7 +234,13 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .dtype         = layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer],
-        .quant_group   = quant_group_,
+        .quant_group   = layer_dtypes_.empty()
+                             ? quant_group_
+                             : (layer_dtypes_[layer] == DType::I8
+                                    ? kKvInt8QuantGroup
+                                    : (layer_dtypes_[layer] == DType::FP8_E4M3FN
+                                           ? kKvFp8QuantGroup
+                                           : 0)),
     };
 }
 
