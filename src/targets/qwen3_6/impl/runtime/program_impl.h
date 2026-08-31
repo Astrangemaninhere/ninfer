@@ -6735,7 +6735,11 @@ std::uint32_t ProgramImplCore::device_kv_prefix_pages(const KVAddressSpaceStore&
         (&addresses == text_kv_addresses.get()) ? *text_kv_pages : *backend_kv_pages;
     std::uint32_t resident = 0;
     for (std::uint32_t page = 0; page < required; ++page) {
-        if (pages.device_resident(addresses.logical_page(address, page))) { ++resident; }
+        // Cold-pool pages restore in place from their raw slots, so they
+        // count as resident for the restore inventory (missing_kv_restore
+        // skips them the same way).
+        const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+        if (pages.device_resident(logical) || pages.cold_compressed(logical)) { ++resident; }
     }
     return resident;
 }
@@ -6772,7 +6776,10 @@ std::uint32_t ProgramImplCore::shared_device_kv_prefix_pages(const KVAddressSpac
     std::uint32_t resident = 0;
     for (std::uint32_t page = 0; page < required; ++page) {
         const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-        if (pages.address_references(logical) > 1 && pages.device_resident(logical)) { ++resident; }
+        if (pages.address_references(logical) > 1 &&
+            (pages.device_resident(logical) || pages.cold_compressed(logical))) {
+            ++resident;
+        }
     }
     return resident;
 }
@@ -6806,7 +6813,10 @@ ProgramImplCore::missing_shared_device_kv_prefix_pages(const KVAddressSpaceStore
     std::uint32_t missing = 0;
     for (std::uint32_t page = 0; page < required; ++page) {
         const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-        if (pages.address_references(logical) > 1 && !pages.device_resident(logical)) { ++missing; }
+        if (pages.address_references(logical) > 1 && !pages.device_resident(logical) &&
+            !pages.cold_compressed(logical)) {
+            ++missing;
+        }
     }
     return missing;
 }
