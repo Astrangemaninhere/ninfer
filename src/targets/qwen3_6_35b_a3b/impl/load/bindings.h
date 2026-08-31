@@ -129,7 +129,7 @@ struct GdnProjectionPayload {
 using RuntimeModelView =
     qwen3_6::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
                        AttentionProjectionPayload, SparseMoePayload,
-                       qwen3_6::DFlashWeights<kDFlashLayers>, kFullAttentionLayers, kGdnLayers>;
+                       qwen3_6::DFlashWeights<kDFlashLayers>, qwen3_6::DFlash2Weights<0>, kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

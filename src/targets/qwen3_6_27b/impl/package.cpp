@@ -95,15 +95,48 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-dflash2") {
+        return WeightsProfile::Qwen38Nvfp4DFlash2;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
+namespace {
+EngineOptions resolved_auto_speculative(const EngineOptions& options,
+                                        detail::WeightsProfile weights_profile) {
+    EngineOptions resolved = options;
+    if (options.speculative.backend != SpeculativeBackend::Auto) { return resolved; }
+    const DType kv_dtype =
+        options.kv_cache == KvCacheStorage::BFloat16
+            ? DType::BF16
+            : (options.kv_cache == KvCacheStorage::Int8Group64
+                   ? DType::I8
+                   : (options.kv_cache == KvCacheStorage::Fp8E4M3Row256
+                          ? DType::FP8_E4M3FN
+                          : DType::BF16));
+    const std::uint32_t draft_capacity =
+        kv_dtype == DType::FP8_E4M3FN ? 8192U : (kv_dtype == DType::I8 ? 4096U : 2048U);
+    // The artifact's frozen startup features enforce this limit; the engine
+    // check makes the fallback graceful (selects MTP) instead of a load error.
+    if (weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2 && !options.enable_vision &&
+        options.max_context <= draft_capacity) {
+        resolved.speculative.backend = SpeculativeBackend::DFlash2;
+        if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 7; }
+    } else {
+        resolved.speculative.backend = SpeculativeBackend::Mtp;
+        if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 3; }
+    }
+    return resolved;
+}
+} // namespace
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    const EngineOptions resolved = resolved_auto_speculative(options, weights_profile);
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(resolved))));
 }
 
 std::unique_ptr<Package::LoadedModel>

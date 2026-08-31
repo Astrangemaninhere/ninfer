@@ -172,7 +172,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 ops::kv_cache_append_prefix(
                     key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
                     dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
-                    state.execution.device.stream);
+                    Config::local_capacity, state.execution.device.stream);
             } else {
                 ops::kv_cache_append_prefix(
                     key_batch, value_batch, position_batch, commit_counts, table_rows, envelope,

@@ -89,6 +89,7 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -263,6 +264,7 @@ struct DFlashDecodeState {
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
+    Tensor egress_proposal_extents;
     Tensor proposal_ids;
     Tensor proposal_positions;
     Tensor append_positions;

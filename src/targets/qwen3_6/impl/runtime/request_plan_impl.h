@@ -571,6 +571,15 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                        shared_source->backend_frontier < plan->reuse_base)))) {
         throw std::logic_error("published DFlash checkpoint is not materializable");
     }
+    if ((is_rewrite_checkpoint_restore(plan->reuse) ||
+         plan->reuse == ReusePath::PrivateLongAnchor ||
+         plan->reuse == ReusePath::SharedStablePrefix) &&
+        speculative_backend == SpeculativeBackend::DFlash2 &&
+        (!dflash2 ||
+         (source != nullptr && source->dflash_context_frontier < plan->reuse_base) ||
+         (shared_source != nullptr && shared_source->backend_frontier < plan->reuse_base))) {
+        throw std::logic_error("published DFlash2 checkpoint is not materializable");
+    }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
     const bool can_retain_rewrite =

@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
+#include "serve/console_log.h"
 #include "serve/translate.h"
 
 #include <algorithm>
@@ -454,10 +455,17 @@ void GenerationService::warmup() {
     turn.content.push_back(std::move(content));
     request.messages.push_back(std::move(turn));
     request.max_tokens = 4;
-    PreparedRequest prepared =
-        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {},
-                     CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
-    run(prepared, nullptr);
+    // The warmup is advisory: a failed round must not take the server down,
+    // the first real request surfaces the real error instead.
+    try {
+        PreparedRequest prepared =
+            prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {},
+                         CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
+        run(prepared, nullptr);
+    } catch (const std::exception& exception) {
+        write_console_log(ConsoleLogLevel::Warning,
+                          std::string("warmup failed (continuing): ") + exception.what());
+    }
 }
 
 } // namespace ninfer::serve

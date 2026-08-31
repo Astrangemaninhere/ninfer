@@ -1,5 +1,6 @@
 #pragma once
 
+#include "targets/qwen3_6_27b/impl/config.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/model_view.h>
@@ -104,6 +105,32 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
+struct DFlash2LayerPlan {
+    artifact::ObjectHandle input_norm;
+    WeightPlan query_key_value;
+    WeightPlan context_key;
+    WeightPlan context_value;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    WeightPlan attention_output;
+    WeightPlan attention_conv_base;
+    WeightPlan attention_conv_projection;
+    artifact::ObjectHandle post_attention_norm;
+    MlpPlan mlp;
+    WeightPlan mlp_conv_base;
+    WeightPlan mlp_conv_projection;
+};
+
+struct DFlash2Plan {
+    WeightPlan feature_projection;
+    artifact::ObjectHandle context_norm;
+    std::array<DFlash2LayerPlan, DFlash2Config::layers> layers;
+    artifact::ObjectHandle final_norm;
+    WeightPlan selector_hidden_projection;
+    WeightPlan selector_predecessor_codebook;
+    WeightPlan selector_successor_codebook;
+};
+
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
@@ -115,6 +142,7 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
+    DFlash2Plan dflash2;
 
     qwen3_6::VisionBackbonePlan vision_backbone;
     qwen3_6::VisionMergerInputPlan vision_merger_input;
@@ -190,10 +218,13 @@ struct MtpAttentionPayload {
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
                        MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
-                       kFullAttentionLayers, kGdnLayers>;
+                       qwen3_6::DFlash2Weights<DFlash2Config::layers>, kFullAttentionLayers,
+                       kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
+using DFlash2Weights       = RuntimeModelView::DFlash2;
+using DFlash2LayerWeights  = qwen3_6::DFlash2LayerWeights;
 
 class LoadedModelData {
 public:
