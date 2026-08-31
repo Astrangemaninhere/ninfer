@@ -17,6 +17,7 @@ struct Variant {
     using TextConfig                     = detail::TextConfig;
     using VisionConfig                   = detail::VisionConfig;
     using DFlashConfig                   = detail::DFlashConfig;
+    using DFlash2Config                  = detail::DFlash2Config;
     using ModelView                      = detail::RuntimeModelView;
     using FullAttentionProjectionWeights = detail::AttentionProjectionPayload;
     using GdnProjectionWeights           = detail::GdnProjectionPayload;
@@ -33,8 +34,7 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
-    static constexpr bool supports_per_layer_kv_defaults    = false;
-    [[nodiscard]] static std::array<DType, 16> default_layer_kv_dtypes(WeightsProfile profile);
+    static constexpr bool supports_dflash2                     = DFlash2Config::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
@@ -44,6 +44,9 @@ struct Variant {
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
                           std::uint32_t batch_size);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    dflash2_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
+                           std::uint32_t batch_size);
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,

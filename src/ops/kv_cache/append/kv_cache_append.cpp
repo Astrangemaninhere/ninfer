@@ -151,8 +151,11 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
 }
 
 void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
-                           KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || cache.capacity != kWindow ||
+                           KVCacheAppendPrefixExecutionEnvelope envelope,
+                           std::uint32_t window) {
+    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim ||
+        cache.capacity != window ||
+        (window != 2048 && window != 4096) ||
         cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
@@ -212,10 +215,12 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& lanes,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
-                            CyclicKVCacheLayerView cache, cudaStream_t stream) {
+                            CyclicKVCacheLayerView cache, std::uint32_t window,
+                            cudaStream_t stream) {
     const auto plan = validate_inputs(k, v, positions, counts, lanes, envelope);
-    validate_cyclic_cache(cache, envelope);
-    detail::kv_cache_append_prefix_launch(k, v, positions, counts, lanes, cache, plan, stream);
+    validate_cyclic_cache(cache, envelope, window);
+    detail::kv_cache_append_prefix_launch(k, v, positions, counts, lanes, cache, plan, window,
+                                          stream);
 }
 
 } // namespace ninfer::ops

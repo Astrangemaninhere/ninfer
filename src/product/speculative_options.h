@@ -12,6 +12,7 @@ namespace ninfer::product {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (value == "auto") { return SpeculativeBackend::Auto; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
@@ -25,6 +26,8 @@ namespace ninfer::product {
         return "dflash";
     case SpeculativeBackend::DFlash2:
         return "dflash2";
+    case SpeculativeBackend::Auto:
+        return "auto";
     }
     return "unknown";
 }
@@ -48,8 +51,17 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::DFlash2:
-        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
-            throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+        if (options.draft_tokens != 0 && options.draft_tokens != 7) {
+            throw std::invalid_argument("--spec dflash2 uses the fixed 7-draft block");
+        }
+        if (options.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument("--spec dflash2 requires the full proposal head");
+        }
+        return;
+    case SpeculativeBackend::Auto:
+        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument(
+                "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2");
         }
         return;
     }

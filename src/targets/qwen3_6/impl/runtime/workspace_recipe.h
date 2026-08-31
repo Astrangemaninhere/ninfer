@@ -252,10 +252,15 @@ struct DFlashAttentionRoots {
     Tensor query;
     Tensor key;
     Tensor attention;
+    Tensor attention_delta;
 };
 
 template <class Config, class Allocator>
 DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens) {
+    Tensor attention_delta;
+    if constexpr (Config::bf16_weights) {
+        attention_delta = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    }
     return {
         matrix(allocator, DType::BF16, Config::hidden, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
@@ -264,19 +269,30 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
         matrix(allocator, DType::BF16, Config::query_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
+        attention_delta,
     };
 }
 
 struct DFlashMlpRoots {
     Tensor hidden;
+    Tensor gate_up;
     Tensor intermediate;
+    Tensor delta;
 };
 
 template <class Config, class Allocator>
 DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
+    Tensor gate_up;
+    Tensor delta;
+    if constexpr (Config::bf16_weights) {
+        gate_up = matrix(allocator, DType::BF16, 2 * Config::intermediate, tokens);
+        delta   = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    }
     return {
         matrix(allocator, DType::BF16, Config::hidden, tokens),
+        gate_up,
         matrix(allocator, DType::BF16, Config::intermediate, tokens),
+        delta,
     };
 }
 
