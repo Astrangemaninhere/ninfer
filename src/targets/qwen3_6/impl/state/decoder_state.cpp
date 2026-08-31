@@ -1,5 +1,4 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
-#include "core/device.h"
 #include "ninfer/ops/cold_i8.h"
 #include "ninfer/ops/entropy_nvfp4_slot.h"
 
@@ -146,17 +145,11 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
         const std::uint32_t cold_pages = spec.max_cold_pages;
         layout.text_kv.slot_bytes = slot_bytes;
         layout.text_kv.max_cold_pages  = spec.max_cold_pages;
-        layout.text_kv.cold_host  = spec.cold_host;
         for (std::uint32_t layer = 0; layer < spec.full_attention_layers; ++layer) {
-            if (!spec.cold_host) {
-                layout.text_kv.cold_slots[layer] = builder.add_tensor(
-                    DType::U8, {slot_bytes, static_cast<std::uint32_t>(spec.kv_heads),
-                                 2, cold_pages},
-                    256, "cold slots L" + std::to_string(layer));
-            }
-            // The validity plane stays device-resident even in host mode:
-            // pack kernels write it on device and the egress check reads it
-            // back; only the (large) slot payload moves to pinned memory.
+            layout.text_kv.cold_slots[layer] = builder.add_tensor(
+                DType::U8, {slot_bytes, static_cast<std::uint32_t>(spec.kv_heads),
+                             2, cold_pages},
+                256, "cold slots L" + std::to_string(layer));
             layout.text_kv.cold_slot_valid[layer] = builder.add_tensor(
                 DType::I32, {static_cast<std::uint32_t>(spec.kv_heads), 2, cold_pages}, 256,
                 "cold slot valid L" + std::to_string(layer));
@@ -170,34 +163,13 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group),
       slot_bytes_(layout.slot_bytes), max_cold_pages_(layout.max_cold_pages),
-      cold_host_(layout.cold_host), layer_dtypes_(layout.layer_dtypes),
-      layer_plane_base_(layout.layer_plane_base) {
+      layer_dtypes_(layout.layer_dtypes), layer_plane_base_(layout.layer_plane_base) {
     cold_slot_used_.assign(max_cold_pages_, 0);
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-        if (cold_host_ && max_cold_pages_ != 0) {
-            // Pinned host slot payload (mapped so pack kernels can write it
-            // through UVA): decode kernels read it back over PCIe. Only the
-            // validity plane is device-resident.
-            const std::size_t bytes =
-                static_cast<std::size_t>(slot_bytes_) * kv_heads_ * 2 * max_cold_pages_;
-            void* host_ptr = nullptr;
-            CUDA_CHECK(cudaHostAlloc(&host_ptr, bytes, cudaHostAllocMapped));
-            cold_host_buffers_[layer] = host_ptr;
-            cold_slots_[layer]        = Tensor(host_ptr, DType::U8,
-                                        {slot_bytes_, kv_heads_, 2,
-                                         static_cast<std::int32_t>(max_cold_pages_)});
-        } else if (layout.cold_slots[layer].region.bytes != 0) {
+        if (layout.cold_slots[layer].region.bytes != 0) {
             cold_slots_[layer] = layout.cold_slots[layer].bind(backing);
-        }
-        if (layout.cold_slot_valid[layer].region.bytes != 0) {
             cold_slot_valid_[layer] = layout.cold_slot_valid[layer].bind(backing);
         }
-    }
-}
-
-PagedKVCache::~PagedKVCache() {
-    for (void* buffer : cold_host_buffers_) {
-        if (buffer != nullptr) { (void)cudaFreeHost(buffer); }
     }
 }
 
