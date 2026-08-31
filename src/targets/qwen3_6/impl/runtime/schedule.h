@@ -109,9 +109,9 @@ struct DFlash2AppendContext {
 };
 
 struct MtpCausalAttentionEnvelopes {
-    ops::CausalAttentionExecutionEnvelope target_verify;
-    ops::CausalAttentionExecutionEnvelope batch;
-    std::array<ops::CausalAttentionExecutionEnvelope, kMaximumMtpDraftTokens - 1> ar;
+    ops::GqaExecutionEnvelope target_verify;
+    ops::GqaExecutionEnvelope batch;
+    std::array<ops::GqaExecutionEnvelope, kMaximumMtpDraftTokens - 1> ar;
 };
 
 struct DFlashEnvelopes {
@@ -157,7 +157,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::CausalAttentionExecutionEnvelope envelope);
+                          ops::GqaExecutionEnvelope envelope);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
                                                     std::span<const TokenId> ids,
@@ -189,10 +189,10 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 // ordinary ingress, share one model schedule, publish continuation hidden by selector, and leave
 // through one compact egress transfer.
 void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   ops::GqaExecutionEnvelope envelope,
                                    DecodeGraphDefinition& definition);
 void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                           ops::CausalAttentionExecutionEnvelope envelope,
+                           ops::GqaExecutionEnvelope envelope,
                            DecodeGraphExecutable* executable);
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
@@ -215,11 +215,11 @@ void dflash_append_context(PrefillContext& state, const Tensor& features, const 
                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size,
                                  std::uint32_t k, DFlashEnvelopes envelopes,
-                                 ops::CausalAttentionExecutionEnvelope target_envelope,
+                                 ops::GqaExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition);
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          DFlashEnvelopes envelopes,
-                         ops::CausalAttentionExecutionEnvelope target_envelope,
+                         ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
 
 [[nodiscard]] DFlashFeatureSink
@@ -234,11 +234,11 @@ void dflash2_append_context(PrefillContext& state, const Tensor& features, const
                             ops::KVCacheAppendPrefixExecutionEnvelope envelope);
 void capture_dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size,
                                   std::uint32_t k, DFlash2Envelopes envelopes,
-                                  ops::CausalAttentionExecutionEnvelope target_envelope,
+                                  ops::GqaExecutionEnvelope target_envelope,
                                   DecodeGraphDefinition& definition);
 void dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size, std::uint32_t k,
                           DFlash2Envelopes envelopes,
-                          ops::CausalAttentionExecutionEnvelope target_envelope,
+                          ops::GqaExecutionEnvelope target_envelope,
                           DecodeGraphExecutable* executable);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

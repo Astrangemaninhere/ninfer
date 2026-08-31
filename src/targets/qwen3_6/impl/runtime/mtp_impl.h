@@ -39,7 +39,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                                rope_position.size_bytes(), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
-    const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
+    const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
                            build_proposal ? &draft0 : nullptr, &rope_position_view, next_embedding);
@@ -58,7 +58,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         Tensor next_draft     = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
         Tensor next_hidden    = state.execution.prefill_hidden.slice(1, i, 1);
         const auto visible    = static_cast<std::uint32_t>(position + i + 1);
-        const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
+        const ops::GqaExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
                                  envelope, next_hidden, logits, next_draft);
         CUDA_CHECK(cudaMemcpyAsync(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
