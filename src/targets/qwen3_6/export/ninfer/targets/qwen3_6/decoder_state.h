@@ -30,6 +30,10 @@ struct DecoderStateSpec {
     std::uint32_t mtp_physical_page_groups  = 0;
     // Entropy-coded cold pool capacity in pages; 0 disables the pool.
     std::uint32_t max_cold_pages            = 0;
+    // When true the cold-slot payload buffers live in pinned host memory
+    // (ColdPolicy::Host): pack kernels write them via UVA and decode kernels
+    // read them back over PCIe. The validity plane stays device-resident.
+    bool cold_host                          = false;
 };
 
 struct PagedKVCacheLayout {
@@ -47,6 +51,8 @@ struct PagedKVCacheLayout {
     std::array<TensorRegion, 16> cold_slot_valid;
     std::int32_t slot_bytes = 0;
     std::uint32_t max_cold_pages = 0;
+    // Cold-slot payload buffers live in pinned host memory when set.
+    bool cold_host = false;
     // Resolved per-layer storage (one entry per full-attention layer).
     std::array<DType, 16> layer_dtypes{};
     // Plane offset of each layer in the page geometry (prefix sums over
@@ -80,6 +86,7 @@ private:
 class PagedKVCache {
 public:
     PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    ~PagedKVCache();
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -130,6 +137,10 @@ private:
     std::array<Tensor, 16> cold_slot_valid_;
     std::int32_t slot_bytes_ = 0;
     std::uint32_t max_cold_pages_ = 0;
+    bool cold_host_ = false;
+    // Host-side cold-slot payload buffers (cold_host_ mode): one pinned
+    // allocation per layer sized [slot_bytes, kv_heads, 2, max_cold_pages].
+    std::array<void*, 16> cold_host_buffers_{};
     std::vector<std::uint8_t> cold_slot_used_;
     std::array<DType, 16> layer_dtypes_{};
     std::array<std::uint32_t, 16> layer_plane_base_{};

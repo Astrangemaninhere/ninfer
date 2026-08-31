@@ -844,7 +844,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
-    if (cold_policy == ColdPolicy::Window) {
+    if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Host) {
         const std::int32_t requant_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
         if (requant_heads > 0) {
             CUDA_CHECK(cudaMalloc(&cold_requant_codes,
@@ -9245,7 +9245,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     SharedPrefixSlotRole::Catalogued;
             // A retained source may carry cold-pool pages: warm them back into
             // physical pages before any prefix fork touches the membership.
-            if (private_source_ready && cold_policy == ColdPolicy::Window) {
+            if (private_source_ready &&
+                (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Host)) {
                 SequenceState& source = continuation_states[transaction.source_index];
                 if (source.kv && source.kv->text.valid() &&
                     text_kv_addresses->active(source.kv->text)) {
@@ -10368,8 +10369,9 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 // decode kernels read cold pages straight from the slots, so no restore is
 // needed on the steady-state path.
 void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
-    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
-        !sequence.kv->text.valid() || cold_requant_codes == nullptr) {
+    if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Host) ||
+        !sequence.kv || decoder == nullptr || !sequence.kv->text.valid() ||
+        cold_requant_codes == nullptr) {
         return;
     }
     KVAddressSpaceStore& store = *text_kv_addresses;
@@ -10584,8 +10586,9 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
 // steady-state decode path reads cold pages directly from their slots, but a
 // rewrite needs real physical pages so append/fork can mutate them again.
 void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page) {
-    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
-        cold_requant_codes == nullptr || sequence.cold_pages.empty()) {
+    if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Host) ||
+        !sequence.kv || decoder == nullptr || cold_requant_codes == nullptr ||
+        sequence.cold_pages.empty()) {
         return;
     }
     KVAddressSpaceStore& store = *text_kv_addresses;
@@ -12053,7 +12056,7 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
     // Cold-pool maintenance at the round boundary (window policy only).
     // Every active sequence maintains its own retired prefix; multi-lane
     // batches compress each lane's pages independently.
-    if (cold_policy == ColdPolicy::Window) {
+    if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Host) {
         for (const std::uint32_t lane : lanes) {
             SequenceState& sequence = active_sequence(lane);
             if (sequence.kv) {
