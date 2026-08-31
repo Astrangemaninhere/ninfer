@@ -1,9 +1,13 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "ninfer/ops/cold_i8.h"
+#include "ninfer/ops/entropy_cold_requant.h"
+#include "ninfer/ops/entropy_nvfp4_slot.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "targets/qwen3_6/impl/runtime/spec_decision.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
@@ -19,6 +23,7 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -603,6 +608,15 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
     };
 }
 
+schedule::DFlash2Envelopes dflash2_envelopes(std::uint32_t min_frontier,
+                                             std::uint32_t max_frontier, std::uint32_t k) {
+    (void)min_frontier;
+    return schedule::DFlash2Envelopes{
+        .local  = {0, max_frontier},
+        .append = {0, k + 1},
+    };
+}
+
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label) {
     const auto it = std::find_if(
@@ -614,6 +628,19 @@ DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
     }
     return *it;
+}
+
+// True when no profile of this batch covers the frontier — the caller's cue
+// to extend the family on demand (on-demand graph capture).
+[[nodiscard]] inline bool graph_profile_missing(const DecodeGraphFamily& family,
+                                                std::uint32_t batch_size,
+                                                std::uint32_t frontier) noexcept {
+    return std::none_of(family.profiles.begin(), family.profiles.end(),
+                        [&](const DecodeGraphProfile& profile) {
+                            return profile.batch_size == batch_size &&
+                                   profile.min_execution_frontier <= frontier &&
+                                   frontier <= profile.max_execution_frontier;
+                        });
 }
 
 void validate_graph_profiles(const std::vector<GraphExecutionProfile>& profiles,
@@ -727,6 +754,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
+      cold_policy(plan.cold_policy), cold_keep_tokens(plan.cold_keep_tokens),
+      cold_host_bytes(plan.cold_host_bytes),
+      graph_capture_ceiling(plan.graph_capture_ceiling),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
@@ -750,6 +780,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt),
+      dflash2_host(plan.speculative_backend == SpeculativeBackend::DFlash2
+                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
+                                                              sizeof(qwen3_6::DFlashDecodeEgress))
+                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
@@ -759,15 +793,19 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.dflash() ||
+        model.dflash2.has_value() != plan.features.dflash2() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
         model.vision.has_value() != plan.features.vision) {
         throw std::invalid_argument(
             "Qwen3.6 loaded weights do not match the frozen startup features");
     }
-    if (model.mtp.has_value() && model.dflash.has_value()) {
+    if (model.mtp.has_value() && (model.dflash.has_value() || model.dflash2.has_value())) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
     }
-    if (model.dflash.has_value() && model.vision.has_value()) {
+    if (model.dflash.has_value() && model.dflash2.has_value()) {
+        throw std::invalid_argument("DFlash and DFlash2 model views are mutually exclusive");
+    }
+    if ((model.dflash.has_value() || model.dflash2.has_value()) && model.vision.has_value()) {
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
     if (workspace_plan.general_capacity == 0 ||
@@ -808,6 +846,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    if (cold_policy == ColdPolicy::Window) {
+        const std::int32_t requant_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
+        if (requant_heads > 0) {
+            CUDA_CHECK(cudaMalloc(&cold_requant_codes,
+                                  8192ULL * static_cast<std::uint64_t>(requant_heads)));
+            CUDA_CHECK(cudaMalloc(&cold_requant_scales,
+                                  1024ULL * static_cast<std::uint64_t>(requant_heads)));
+            cold_requant_heads = static_cast<std::uint32_t>(requant_heads);
+        }
+    }
     text_host_kv_page_stride =
         plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
@@ -846,6 +894,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
+    }
+    if (plan.persistent.dflash2) { dflash2.emplace(backing, *plan.persistent.dflash2); }
+    if (dflash2.has_value() != plan.features.dflash2()) {
+        throw std::logic_error("DFlash2 state does not match the frozen sequence plan");
     }
     if (qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
         backend_host_kv_page_stride =
@@ -892,10 +944,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (io.ordinary.has_value() != (speculative_backend == SpeculativeBackend::None)) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
-    if (io.dflash_prefill.has_value() != (speculative_backend == SpeculativeBackend::DFlash)) {
+    if (io.dflash_prefill.has_value() !=
+        (speculative_backend == SpeculativeBackend::DFlash ||
+         speculative_backend == SpeculativeBackend::DFlash2)) {
         throw std::logic_error("DFlash prefill scratch does not match the sequence plan");
     }
-    if (io.dflash_decode.has_value() != (speculative_backend == SpeculativeBackend::DFlash)) {
+    if (io.dflash_decode.has_value() !=
+        (speculative_backend == SpeculativeBackend::DFlash ||
+         speculative_backend == SpeculativeBackend::DFlash2)) {
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
@@ -946,6 +1002,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         *dflash_host_ingress = {};
         *dflash_host_egress  = {};
     }
+    if (dflash2_host) {
+        dflash2_host_ingress = static_cast<qwen3_6::DFlashDecodeIngress*>(dflash2_host->data());
+        dflash2_host_egress  = reinterpret_cast<qwen3_6::DFlashDecodeEgress*>(
+            static_cast<unsigned char*>(dflash2_host->data()) +
+            sizeof(qwen3_6::DFlashDecodeIngress));
+        *dflash2_host_ingress = {};
+        *dflash2_host_egress  = {};
+    }
     if (io.dflash_prefill) {
         CUDA_CHECK(cudaMemsetAsync(io.dflash_prefill->produced_count.data, 0,
                                    io.dflash_prefill->produced_count.bytes(), device.stream));
@@ -967,6 +1031,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (cold_requant_codes != nullptr) {
+        (void)cudaFree(cold_requant_codes);
+        (void)cudaFree(cold_requant_scales);
+        cold_requant_codes  = nullptr;
+        cold_requant_scales = nullptr;
+    }
 }
 
 std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
@@ -1065,6 +1135,7 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
+                nullptr,
                 nullptr,
                 nullptr,
                 cursor,
@@ -1871,6 +1942,9 @@ ProgramImplCore::checkpoint_restore_requirements(const SequenceKVBundle& kv,
         for (std::uint32_t page = 0; page < required; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.device_resident(logical)) { continue; }
+            // Cold-pool pages restore in place from their raw slots; they
+            // need no host transfer.
+            if (pages.cold_compressed(logical)) { continue; }
             if (!pages.host_resident(logical)) {
                 throw std::logic_error("checkpoint KV page has no restorable replica");
             }
@@ -4724,6 +4798,25 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             for (std::uint32_t page = 0; page < mapped; ++page) {
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 if (pages.device_resident(logical)) { continue; }
+                if (pages.cold_compressed(logical)) {
+                    // Cold-pool page: its restorable source is the raw cold
+                    // slot, not a host replica. Restore synchronously here
+                    // (same reservation); the activation publish
+                    // (publish_membership) republishes the physical mapping.
+                    if (source_state == nullptr) {
+                        throw std::logic_error("cold checkpoint page has no source bookkeeping");
+                    }
+                    auto entry = std::find_if(
+                        source_state->cold_pages.begin(), source_state->cold_pages.end(),
+                        [page](const SequenceState::ColdPageEntry& e) { return e.page == page; });
+                    if (entry == source_state->cold_pages.end()) {
+                        throw std::logic_error("cold checkpoint page has no slot record");
+                    }
+                    const DeviceKVPageHandle restored =
+                        pages.restore_from_cold(logical, reservation);
+                    restore_cold_page(*source_state, page, entry->slot, restored);
+                    continue;
+                }
                 if (!pages.host_resident(logical) || !host_kv_extents) {
                     throw std::logic_error("checkpoint KV page has no restorable replica");
                 }
@@ -6550,7 +6643,11 @@ std::uint32_t ProgramImplCore::device_kv_prefix_pages(const KVAddressSpaceStore&
         (&addresses == text_kv_addresses.get()) ? *text_kv_pages : *backend_kv_pages;
     std::uint32_t resident = 0;
     for (std::uint32_t page = 0; page < required; ++page) {
-        if (pages.device_resident(addresses.logical_page(address, page))) { ++resident; }
+        // Cold-pool pages restore in place from their raw slots, so they
+        // count as resident for the restore inventory (missing_kv_restore
+        // skips them the same way).
+        const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+        if (pages.device_resident(logical) || pages.cold_compressed(logical)) { ++resident; }
     }
     return resident;
 }
@@ -6587,7 +6684,10 @@ std::uint32_t ProgramImplCore::shared_device_kv_prefix_pages(const KVAddressSpac
     std::uint32_t resident = 0;
     for (std::uint32_t page = 0; page < required; ++page) {
         const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-        if (pages.address_references(logical) > 1 && pages.device_resident(logical)) { ++resident; }
+        if (pages.address_references(logical) > 1 &&
+            (pages.device_resident(logical) || pages.cold_compressed(logical))) {
+            ++resident;
+        }
     }
     return resident;
 }
@@ -6621,7 +6721,10 @@ ProgramImplCore::missing_shared_device_kv_prefix_pages(const KVAddressSpaceStore
     std::uint32_t missing = 0;
     for (std::uint32_t page = 0; page < required; ++page) {
         const LogicalKVPageHandle logical = addresses.logical_page(address, page);
-        if (pages.address_references(logical) > 1 && !pages.device_resident(logical)) { ++missing; }
+        if (pages.address_references(logical) > 1 && !pages.device_resident(logical) &&
+            !pages.cold_compressed(logical)) {
+            ++missing;
+        }
     }
     return missing;
 }
@@ -8494,17 +8597,20 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                     decoder->text_kv,
                     decoder->mtp_cache(),
                     dflash ? &*dflash : nullptr,
+                    dflash2 ? &*dflash2 : nullptr,
                     cursor,
                     nullptr,
                     nullptr,
                     selectors.source,
                     selectors.destination,
                     0,
-                    dflash_host_ingress};
+                    dflash_host_ingress,
+                    dflash2_host_ingress};
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);
-                if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (speculative_backend == SpeculativeBackend::DFlash ||
+                    speculative_backend == SpeculativeBackend::DFlash2) {
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
@@ -9055,6 +9161,15 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 transaction.shared_source_index < shared_prefix_capacity &&
                 shared_prefix_slots[transaction.shared_source_index].role ==
                     SharedPrefixSlotRole::Catalogued;
+            // A retained source may carry cold-pool pages: warm them back into
+            // physical pages before any prefix fork touches the membership.
+            if (private_source_ready && cold_policy == ColdPolicy::Window) {
+                SequenceState& source = continuation_states[transaction.source_index];
+                if (source.kv && source.kv->text.valid() &&
+                    text_kv_addresses->active(source.kv->text)) {
+                    warm_cold_prefix(source, source.text_kv_valid);
+                }
+            }
             if (private_source_ready == shared_source_ready ||
                 transaction.reserved_state_count != state_slots || state_slots == 0 ||
                 !transaction.root_text_address || !transaction.text_prefix_fork ||
@@ -9430,7 +9545,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
-                                                                : 0U;
+            : speculative_backend == SpeculativeBackend::DFlash2 ? 0U
+                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
@@ -9459,6 +9575,16 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             dflash_host_ingress->dflash_kv_table_rows[0] =
                 backend_kv_addresses->bound_row(*sequence.kv->backend);
             CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                                       device.stream));
+        } else if (speculative_backend == SpeculativeBackend::DFlash2) {
+            if (!dflash2 || !io.dflash_decode) {
+                throw std::logic_error("DFlash2 prefill state is incomplete");
+            }
+            *dflash2_host_ingress                         = {};
+            dflash2_host_ingress->active_lanes[0]         = static_cast<std::int32_t>(sequence.lane);
+            dflash2_host_ingress->dflash_kv_table_rows[0] = 0;
+            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash2_host_ingress,
                                        sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                        device.stream));
         }
@@ -9592,7 +9718,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         timing.resume_submit();
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
-
+    
         if (needs_hidden_correction) {
             const auto batch = static_cast<std::int32_t>(lanes.size());
             Tensor selector_tensor;
@@ -9605,7 +9731,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
                 destinations = frame.state_destination_slots.slice(0, 0, batch);
-            } else if (speculative_backend == SpeculativeBackend::DFlash && io.dflash_decode) {
+            } else if ((speculative_backend == SpeculativeBackend::DFlash ||
+                        speculative_backend == SpeculativeBackend::DFlash2) &&
+                       io.dflash_decode) {
                 qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
                 selector_tensor                   = frame.proposal_extents.slice(0, 0, batch);
                 hidden                            = frame.target_hidden.slice(2, 0, batch);
@@ -9623,7 +9751,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
                          device.stream);
         }
 
-        if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (speculative_backend == SpeculativeBackend::DFlash) {
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
             std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
@@ -9644,7 +9772,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             }
         }
 
-        timing.begin_wait();
+            timing.begin_wait();
         device.synchronize();
         timing.end_wait();
         work.reset();
@@ -9674,7 +9802,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             const TokenId* token_base =
                 speculative_backend == SpeculativeBackend::Mtp
                     ? mtp_host_egress->licensed_tokens.data() + row * width
-                    : dflash_host_egress->licensed_tokens.data() + row * width;
+                    : speculative_backend == SpeculativeBackend::DFlash2
+                          ? dflash2_host_egress->licensed_tokens.data() + row * width
+                          : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
             sequence.prefix_digests.append_generated(
@@ -10097,6 +10227,12 @@ void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
     }
     if (text_kv_addresses) { (void)text_kv_addresses->release(sequence.kv->text); }
     sequence.kv.reset();
+    if (decoder != nullptr) {
+        for (const auto& cold : sequence.cold_pages) {
+            decoder->text_kv.release_cold_slot(cold.slot);
+        }
+    }
+    sequence.cold_pages.clear();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }
 
@@ -10140,6 +10276,262 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+}
+
+
+// Cold-pool maintenance: pack the retired prefix of a sequence's text KV into
+// raw entropy slots and detach those pages (sentinel entries in the block
+// table; physical pages return to the pool). Runs when the window policy is
+// active and at least cold_keep_tokens lie behind the decode frontier. The
+// decode kernels read cold pages straight from the slots, so no restore is
+// needed on the steady-state path.
+void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
+    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
+        !sequence.kv->text.valid() || cold_requant_codes == nullptr) {
+        return;
+    }
+    KVAddressSpaceStore& store = *text_kv_addresses;
+    KVAddressSpaceHandle text  = sequence.kv->text;
+    const std::uint32_t total_pages = store.mapped_pages(text);
+    if (total_pages == 0) { return; }
+
+    const std::uint32_t cold_pages =
+        sequence.text_kv_valid > cold_keep_tokens
+            ? (sequence.text_kv_valid - cold_keep_tokens) / kPagedKVPageSize
+            : 0;
+    const std::uint32_t limit = cold_pages < total_pages ? cold_pages : total_pages;
+    if (limit == 0) { return; }
+
+    const std::int32_t kv_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
+    const std::uint32_t layers  = decoder->text_kv.layers();
+    // Per-layer cold packing: INT8 planes are requantized to E2M1 g64 and
+    // stored in raw 9232 B slots; NVFP4 planes keep their native E2M1/ISO3
+    // nibbles and are rANS-encoded into entropy slots. The 9536 B slot buffer
+    // covers both formats, so mixed-dtype stacks pack per layer instead of
+    // skipping the whole cold transfer.
+    std::vector<std::int32_t> k_flags(static_cast<std::size_t>(kv_heads));
+    std::vector<std::int32_t> v_flags(static_cast<std::size_t>(kv_heads));
+    std::uint32_t compressed = 0;
+
+    for (std::uint32_t page = sequence.cold_frontier; page < limit; ++page) {
+        if (!store.can_cold_transfer(text, page)) { continue; }
+        const std::int32_t slot = decoder->text_kv.allocate_cold_slot();
+        if (slot < 0) { break; }  // cold pool exhausted: keep the rest hot.
+
+        bool success = true;
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+            const Tensor cold_slots          = view.cold_slots;
+            if (cold_slots.data == nullptr) { continue; }
+            const DeviceKVPageHandle ph = store.physical_page(text, page);
+            const std::int32_t physical = ph.index();
+            auto* k_codes = static_cast<const std::uint8_t*>(view.k_pages.data) +
+                            physical * view.k_pages.nb[3];
+            auto* v_codes = static_cast<const std::uint8_t*>(view.v_pages.data) +
+                            physical * view.v_pages.nb[3];
+            auto* k_scales = static_cast<const std::uint8_t*>(view.k_scale_pages.data) +
+                             physical * view.k_scale_pages.nb[3];
+            auto* v_scales = static_cast<const std::uint8_t*>(view.v_scale_pages.data) +
+                             physical * view.v_scale_pages.nb[3];
+            auto* k_slot = static_cast<std::uint8_t*>(cold_slots.data) +
+                           static_cast<std::int64_t>(slot) * cold_slots.nb[3];
+            auto* v_slot = k_slot + cold_slots.nb[2];
+            auto* k_valid = static_cast<std::int32_t*>(view.cold_slot_valid.data) +
+                            static_cast<std::int64_t>(slot) * view.cold_slot_valid.nb[2];
+            auto* v_valid = reinterpret_cast<std::int32_t*>(
+                reinterpret_cast<std::uint8_t*>(k_valid) + view.cold_slot_valid.nb[1]);
+            if (view.dtype == DType::I8) {
+                // INT8 tier: requant to E2M1 g64 and store the raw nibble slot.
+                ops::entropy_cold_requant_raw(
+                    k_codes, k_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::cold_i8_slot_pack_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
+                    k_valid, view.slot_bytes, device.stream);
+                ops::entropy_cold_requant_raw(
+                    v_codes, v_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::cold_i8_slot_pack_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
+                    v_valid, view.slot_bytes, device.stream);
+            } else if (view.dtype == DType::NVFP4) {
+                // NVFP4 tier: keep the native E2M1 (K) / ISO3 (V) nibbles,
+                // requantize scales to g64 for a skew that rANS compresses,
+                // and encode into the entropy slot. On incompressible pages
+                // the slot flags stay 0 and the hot plane keeps serving.
+                ops::entropy_cold_requant_raw(
+                    k_codes, k_scales, ops::EntropyColdRequantMode::Nvfp4G16, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::entropy_nvfp4_slot_encode_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
+                    view.slot_bytes, k_valid, nullptr, kv_heads, device.stream);
+                ops::entropy_cold_requant_raw(
+                    v_codes, v_scales, ops::EntropyColdRequantMode::Iso3VG16, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::entropy_nvfp4_slot_encode_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
+                    view.slot_bytes, v_valid, nullptr, kv_heads, device.stream);
+            } else {
+                success = false;  // bf16/fp8 layers have no cold slot codec
+                break;
+            }
+        }
+        if (!success) {
+            decoder->text_kv.release_cold_slot(slot);
+            continue;
+        }
+        device.synchronize();
+
+        // A slot only counts once every head's pack kernel committed its valid
+        // flag; otherwise the page would decode as garbage through the slot.
+        // Valid tensor is [kv_heads, 2, pages] col-major: head innermost,
+        // page outermost, so slot pages sit at slot * 2*kv_heads.
+        const Tensor cold_valid = decoder->text_kv.cold_slot_valid(0);
+        auto* k_valid = static_cast<std::int32_t*>(cold_valid.data) +
+                        static_cast<std::int64_t>(slot) * cold_valid.nb[2];
+        auto* v_valid = reinterpret_cast<std::int32_t*>(
+            reinterpret_cast<std::uint8_t*>(k_valid) + cold_valid.nb[1]);
+        CUDA_CHECK(cudaMemcpy(k_flags.data(), k_valid,
+                              k_flags.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(v_flags.data(), v_valid,
+                              v_flags.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+        const bool valid =
+            std::all_of(k_flags.begin(), k_flags.end(),
+                        [](std::int32_t value) { return value != 0; }) &&
+            std::all_of(v_flags.begin(), v_flags.end(),
+                        [](std::int32_t value) { return value != 0; });
+        if (!valid) {
+            decoder->text_kv.release_cold_slot(slot);
+            continue;
+        }
+
+        // Publish the sentinel and return the physical page to the pool.
+        const std::int32_t entry = paged_kv_cold_entry(slot);
+        decoder->text_kv.execution_tables().publish_indices(
+            store.execution_row(text).handle(), page, std::span<const std::int32_t>(&entry, 1),
+            device.stream);
+        store.transfer_to_cold(text, page);
+        sequence.cold_pages.emplace_back(page, slot);
+        sequence.cold_frontier = page + 1;
+        ++compressed;
+    }
+    if (compressed != 0) {
+        device.synchronize();
+        std::fprintf(stderr, "[cold] compressed %u prefix pages (kept %u+)\n", compressed,
+                     cold_keep_tokens);
+    }
+}
+
+// Restore one cold page's data from its raw slot into the physical page and
+// release the slot. Shared by the rewrite warm path and the checkpoint
+// restore path (which must repopulate cold pages without a host replica).
+void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t page,
+                                        std::int32_t slot, const DeviceKVPageHandle& physical) {
+    const int kv_heads          = decoder->text_kv.batch_layer_view(0).num_kv_heads;
+    const std::uint32_t layers  = decoder->text_kv.layers();
+    const std::int32_t ph_index = physical.index();
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+        const Tensor cold_slots          = view.cold_slots;
+        if (cold_slots.data == nullptr) { continue; }
+        if (view.dtype == DType::NVFP4) {
+            // NVFP4 tier: rANS-decode the slot back into the native E2M1/ISO3
+            // code plane, then scatter the slot's scale tail into the plane.
+            auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
+            auto* v_slot_base = k_slot_base + cold_slots.nb[2];
+            auto* k_codes_nv = static_cast<std::uint8_t*>(view.k_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
+            auto* v_codes_nv = static_cast<std::uint8_t*>(view.v_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
+            auto* k_scales_nv = static_cast<std::uint8_t*>(view.k_scale_pages.data) +
+                                static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3];
+            auto* v_scales_nv = static_cast<std::uint8_t*>(view.v_scale_pages.data) +
+                                static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3];
+            ops::entropy_nvfp4_slot_restore_plane_raw(
+                k_slot_base + slot * cold_slots.nb[3], view.slot_bytes, 0, kv_heads,
+                static_cast<std::uint8_t*>(cold_requant_codes), k_codes_nv, device.stream);
+            ops::entropy_nvfp4_slot_restore_plane_raw(
+                v_slot_base + slot * cold_slots.nb[3], view.slot_bytes, 0, kv_heads,
+                static_cast<std::uint8_t*>(cold_requant_codes), v_codes_nv, device.stream);
+            std::int32_t page_ids[1] = {ph_index};
+            ops::entropy_nvfp4_slot_scales_scatter_raw(
+                k_slot_base + slot * cold_slots.nb[3], view.slot_bytes,
+                static_cast<int>(cold_slots.nb[3]), kv_heads, 1, page_ids,
+                static_cast<int>(view.k_scale_pages.nb[3]), k_scales_nv, device.stream);
+            ops::entropy_nvfp4_slot_scales_scatter_raw(
+                v_slot_base + slot * cold_slots.nb[3], static_cast<int>(cold_slots.nb[3]),
+                static_cast<int>(cold_slots.nb[3]) * kv_heads, kv_heads, 1, page_ids,
+                static_cast<int>(view.v_scale_pages.nb[3]), v_scales_nv, device.stream);
+        } else if (view.dtype == DType::I8) {
+            auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
+            auto* v_slot_base = k_slot_base + cold_slots.nb[2];
+            auto* k_codes_i8 = static_cast<std::int8_t*>(view.k_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
+            auto* v_codes_i8 = static_cast<std::int8_t*>(view.v_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
+            auto* k_scales_h = static_cast<void*>(
+                static_cast<std::uint8_t*>(view.k_scale_pages.data) +
+                static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3]);
+            auto* v_scales_h = static_cast<void*>(
+                static_cast<std::uint8_t*>(view.v_scale_pages.data) +
+                static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3]);
+            ops::cold_i8_slot_restore_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                          k_codes_i8, k_scales_h, view.slot_bytes, device.stream);
+            ops::cold_i8_slot_restore_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                          v_codes_i8, v_scales_h, view.slot_bytes, device.stream);
+        }
+    }
+    decoder->text_kv.release_cold_slot(slot);
+    auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
+                              [page](const SequenceState::ColdPageEntry& e) {
+                                  return e.page == page;
+                              });
+    if (entry != sequence.cold_pages.end()) { sequence.cold_pages.erase(entry); }
+    sequence.cold_frontier = 0;  // pages are hot again; rescan from the front
+}
+
+// Warm-restore the cold prefix of a sequence (rewrite/resume paths only): the
+// steady-state decode path reads cold pages directly from their slots, but a
+// rewrite needs real physical pages so append/fork can mutate them again.
+void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page) {
+    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
+        cold_requant_codes == nullptr || sequence.cold_pages.empty()) {
+        return;
+    }
+    KVAddressSpaceStore& store = *text_kv_addresses;
+    KVAddressSpaceHandle text  = sequence.kv->text;
+    const std::uint32_t mapped = store.mapped_pages(text);
+    const std::uint32_t pages  = std::min(end_page, mapped);
+    if (pages == 0) { return; }
+
+    std::uint32_t restored = 0;
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        if (!store.cold_compressed(text, page)) { continue; }
+        auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
+                                  [page](const SequenceState::ColdPageEntry& e) {
+                                      return e.page == page;
+                                  });
+        if (entry == sequence.cold_pages.end()) { continue; }
+        const DeviceKVPageHandle physical = store.restore_from_cold(text, page);
+        const std::int32_t ph_index      = physical.index();
+        restore_cold_page(sequence, page, entry->slot, physical);
+        decoder->text_kv.execution_tables().publish_indices(
+            store.execution_row(text).handle(), page,
+            std::span<const std::int32_t>(&ph_index, 1), device.stream);
+        ++restored;
+    }
+    if (restored != 0) {
+        device.synchronize();
+        std::fprintf(stderr, "[cold] restored %u prefix pages\n", restored);
+    }
 }
 
 void ProgramImplCore::prepare_graphs() {
@@ -10247,6 +10639,11 @@ void ProgramImplCore::prepare_graphs() {
                     dflash->pending_features.slice(2, static_cast<std::int32_t>(row), 1);
                 CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream));
             }
+            if (dflash2) {
+                const Tensor pending =
+                    dflash2->pending_features.slice(2, static_cast<std::int32_t>(row), 1);
+                CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream));
+            }
         }
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
@@ -10255,24 +10652,33 @@ void ProgramImplCore::prepare_graphs() {
                            checked_i32(frontier, "graph representative MTP position"));
         }
         if (io.dflash_decode) {
-            *dflash_host_ingress       = {};
-            *dflash_host_egress        = {};
+            // DFlash and DFlash2 share the decode frame but keep separate
+            // host ingress/egress buffers; only the active backend's is
+            // allocated (dflash_host_* vs dflash2_host_*).
+            qwen3_6::DFlashDecodeIngress* ingress =
+                speculative_backend == SpeculativeBackend::DFlash2 ? dflash2_host_ingress
+                                                                   : dflash_host_ingress;
+            qwen3_6::DFlashDecodeEgress* egress =
+                speculative_backend == SpeculativeBackend::DFlash2 ? dflash2_host_egress
+                                                                   : dflash_host_egress;
+            *ingress                 = {};
+            *egress                  = {};
             const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
             for (std::uint32_t row = 0; row < batch_size; ++row) {
-                dflash_host_ingress->anchors[row] = 0;
-                dflash_host_ingress->execution_frontiers[row] =
+                ingress->anchors[row] = 0;
+                ingress->execution_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash frontier");
-                dflash_host_ingress->context_frontiers[row] =
+                ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
-                dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
-                dflash_host_ingress->target_valid_columns[row] =
+                ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
+                ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
-                dflash_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
-                dflash_host_ingress->dflash_kv_table_rows[row]    = static_cast<std::int32_t>(row);
-                dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(row);
-                dflash_host_ingress->state_source_slots[row]      = capture_state_slot(row);
-                dflash_host_ingress->state_destination_slots[row] = capture_state_slot(row);
-                dflash_host_ingress->sampling[row]                = {};
+                ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
+                ingress->dflash_kv_table_rows[row]    = static_cast<std::int32_t>(row);
+                ingress->active_lanes[row]            = static_cast<std::int32_t>(row);
+                ingress->state_source_slots[row]      = capture_state_slot(row);
+                ingress->state_destination_slots[row] = capture_state_slot(row);
+                ingress->sampling[row]                = {};
             }
         }
         if (io.mtp_decode) {
@@ -10337,6 +10743,18 @@ void ProgramImplCore::prepare_graphs() {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
+        // On-demand capture: with a positive ceiling, startup captures only
+        // the segments fully below it; decode extends on growth crossings and
+        // full coverage is revalidated after each extension.
+        std::vector<GraphExecutionProfile> startup_profiles;
+        if (graph_capture_ceiling == 0) {
+            startup_profiles = ordinary_profiles;
+        } else {
+            for (const GraphExecutionProfile& planned : ordinary_profiles) {
+                if (planned.max <= graph_capture_ceiling) { startup_profiles.push_back(planned); }
+            }
+            if (startup_profiles.empty()) { startup_profiles.push_back(ordinary_profiles.front()); }
+        }
         schedule::OrdinaryBatchContext ordinary_state{
             execution_core(),      decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
@@ -10348,9 +10766,9 @@ void ProgramImplCore::prepare_graphs() {
                                         nullptr);
         device.synchronize();
 
-        ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+        ordinary_graphs.profiles.reserve(startup_profiles.size() * ordinary_batch_limit);
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
-            for (const GraphExecutionProfile planned : ordinary_profiles) {
+            for (const GraphExecutionProfile planned : startup_profiles) {
                 ordinary_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
                 profile.batch_size             = batch_size;
@@ -10358,12 +10776,15 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
+                const ops::GqaExecutionEnvelope envelope{planned.min + 1,
                                                                      planned.max + 1};
                 schedule::capture_ordinary_decode_batch(ordinary_state,
                                                         static_cast<std::int32_t>(batch_size),
                                                         envelope, profile.definition);
             }
+        }
+        if (graph_capture_ceiling == 0) {
+            validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         }
     }
 
@@ -10413,7 +10834,7 @@ void ProgramImplCore::prepare_graphs() {
                                                   *dflash_host_egress,
                                                   state_images->continuation_hidden_store()};
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
-        const ops::CausalAttentionExecutionEnvelope code_warm_target{
+        const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
         prepare_representative(code_warm.min, 1);
@@ -10437,7 +10858,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope target_envelope{
+                const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
                         capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
@@ -10445,6 +10866,57 @@ void ProgramImplCore::prepare_graphs() {
                 schedule::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
                     dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
+                    profile.definition);
+            }
+        }
+    }
+    if (speculative_backend == SpeculativeBackend::DFlash2) {
+        const auto batch_one_profiles = dflash2_graph_profiles(capacity, draft_window, 1);
+        validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash2");
+        schedule::DFlash2BatchContext dflash2_state{execution_core(),
+                                                    decoder->text_kv,
+                                                    *dflash2,
+                                                    *io.dflash_decode,
+                                                    *dflash2_host_ingress,
+                                                    *dflash2_host_egress,
+                                                    state_images->continuation_hidden_store()};
+        const GraphExecutionProfile code_warm = batch_one_profiles.front();
+        const ops::GqaExecutionEnvelope code_warm_target{
+            1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
+        std::fprintf(stderr, "[df2diag] prepare_representative min=%u\n", code_warm.min);
+        prepare_representative(code_warm.min, 1);
+        std::fprintf(stderr, "[df2diag] after prepare_representative\n");
+        device.synchronize();
+        std::fprintf(stderr, "[df2diag] calling dflash2_decode_batch\n");
+        schedule::dflash2_decode_batch(dflash2_state, 1, draft_window,
+                                       dflash2_envelopes(code_warm.min, code_warm.max, draft_window),
+                                       code_warm_target, nullptr);
+        std::fprintf(stderr, "[df2diag] after dflash2_decode_batch\n");
+        device.synchronize();
+
+        dflash2_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
+        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+            const auto planned_profiles =
+                batch_size == 1 ? batch_one_profiles
+                                : dflash2_graph_profiles(capacity, draft_window, batch_size);
+            validate_graph_profiles(planned_profiles, capacity - 1, "DFlash2");
+            for (const GraphExecutionProfile planned : planned_profiles) {
+                dflash2_graphs.profiles.emplace_back();
+                DecodeGraphProfile& profile    = dflash2_graphs.profiles.back();
+                profile.batch_size             = batch_size;
+                profile.min_execution_frontier = planned.min;
+                profile.max_execution_frontier = planned.max;
+                profile.topology_class =
+                    planned.topology_class * max_concurrency + (batch_size - 1U);
+                const ops::GqaExecutionEnvelope target_envelope{
+                    1,
+                    static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
+
+                schedule::capture_dflash2_decode_batch(
+                    dflash2_state, static_cast<std::int32_t>(batch_size), draft_window,
+                    dflash2_envelopes(planned.min, planned.max, draft_window), target_envelope,
                     profile.definition);
             }
         }
@@ -10459,6 +10931,9 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::DFlash) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
     }
+    if (speculative_backend == SpeculativeBackend::DFlash2) {
+        instantiate_graph_family(dflash2_graphs, "DFlash2", device, prepare_representative);
+    }
 
     clear_stable_controls();
     state_images->zero_all(device.stream);
@@ -10469,6 +10944,14 @@ void ProgramImplCore::prepare_graphs() {
                                    dflash->prefill_positions.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(dflash->pending_features.data, 0,
                                    dflash->pending_features.bytes(), device.stream));
+    }
+    if (dflash2) {
+        CUDA_CHECK(cudaMemsetAsync(dflash2->prefill_features.data, 0,
+                                   dflash2->prefill_features.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(dflash2->prefill_positions.data, 0,
+                                   dflash2->prefill_positions.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(dflash2->pending_features.data, 0,
+                                   dflash2->pending_features.bytes(), device.stream));
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     device.synchronize();
@@ -10495,6 +10978,76 @@ void ProgramImplCore::prepare_graphs() {
         release_capture_rows(*backend_kv_addresses, mtp_capture_allocations);
     }
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
+}
+
+schedule::ExecutionCore ProgramImplCore::make_execution_core() {
+    return schedule::ExecutionCore{device,
+                                   model,
+                                   work,
+                                   state_images->linear(),
+                                   replay_records ? &*replay_records : nullptr,
+                                   io,
+                                   prefill_hidden,
+                                   prefill_chunk,
+                                   proposal_head};
+}
+
+// On-demand graph capture: capture the missing ordinary-family segments that
+// cover `frontier` for one batch size. One segment per growth crossing; each
+// is captured exactly once and the family coverage check revalidates. The
+// capture reuses prepare_graphs' dummy-page machinery through the address
+// store: one transient address space on a dedicated execution row whose
+// private page is repeated across the whole table, so arbitrary envelopes
+// read/write valid addresses without disturbing any live request.
+void ProgramImplCore::extend_ordinary_graphs(std::uint32_t batch_size,
+                                             std::uint32_t frontier) {
+    const auto ordinary_profiles = ordinary_graph_profiles(capacity);
+    std::vector<GraphExecutionProfile> missing;
+    for (const GraphExecutionProfile& planned : ordinary_profiles) {
+        const bool covered =
+            std::any_of(ordinary_graphs.profiles.begin(), ordinary_graphs.profiles.end(),
+                        [&](const DecodeGraphProfile& profile) {
+                            return profile.batch_size == batch_size &&
+                                   profile.min_execution_frontier == planned.min &&
+                                   profile.max_execution_frontier == planned.max;
+                        });
+        if (!covered && planned.min <= frontier) { missing.push_back(planned); }
+    }
+    if (missing.empty()) { return; }
+    // Row max_concurrency is the dedicated never-bound capture row (the
+    // address store is sized max_concurrency + 1); request rows 0..C-1 stay
+    // untouched during runtime capture.
+    std::optional<KVAddressSpaceHandle> allocation =
+        text_kv_addresses->create_active(1, static_cast<std::int32_t>(max_concurrency));
+    if (!allocation) { throw std::bad_alloc(); }
+    text_kv_addresses->materialize_to_tokens(*allocation, 1, device.stream);
+    decoder->text_kv.execution_tables().publish_repeated(
+        text_kv_addresses->execution_row(*allocation).handle(),
+        text_kv_addresses->physical_page(*allocation, 0),
+        decoder->text_kv.execution_tables().logical_page_capacity(), device.stream);
+    device.synchronize();
+
+    schedule::OrdinaryBatchContext ordinary_state{
+        make_execution_core(), decoder->text_kv,
+        *io.ordinary,          *ordinary_host_ingress,
+        *ordinary_host_egress, state_images->continuation_hidden_store()};
+    for (const GraphExecutionProfile& planned : missing) {
+        ordinary_graphs.profiles.emplace_back();
+        DecodeGraphProfile& profile    = ordinary_graphs.profiles.back();
+        profile.batch_size             = batch_size;
+        profile.min_execution_frontier = planned.min;
+        profile.max_execution_frontier = planned.max;
+        profile.topology_class         = planned.topology_class * max_concurrency + (batch_size - 1U);
+        const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+        schedule::capture_ordinary_decode_batch(ordinary_state,
+                                                static_cast<std::int32_t>(batch_size), envelope,
+                                                profile.definition);
+    }
+    if (text_kv_addresses->active(*allocation)) { text_kv_addresses->deactivate(*allocation); }
+    (void)text_kv_addresses->release(*allocation);
+    std::fprintf(stderr, "[graphs] extended ordinary family: batch %u +%zu segments through "
+                         "frontier %u\n",
+                 batch_size, missing.size(), frontier);
 }
 
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
@@ -10667,6 +11220,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             decoder->text_kv,
             decoder->mtp_cache(),
             dflash ? &*dflash : nullptr,
+            dflash2 ? &*dflash2 : nullptr,
             staged.cursor,
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
@@ -10674,7 +11228,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             selectors.source,
             selectors.destination,
             staged.initial_mtp_extent,
-            dflash_host_ingress};
+            dflash_host_ingress,
+            dflash2_host_ingress};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -10769,7 +11324,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 final_chunk_tokens     = result.processed_tokens;
                 sequence.text_kv_valid = staged.cursor;
                 if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
-                if (speculative_backend == SpeculativeBackend::DFlash) {
+                if (speculative_backend == SpeculativeBackend::DFlash ||
+                    speculative_backend == SpeculativeBackend::DFlash2) {
                     sequence.dflash_context_frontier = staged.cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
@@ -10956,8 +11512,18 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
-        ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+        ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
+            // On-demand capture: with a startup ceiling, growth past the
+            // captured segments extends the family once per crossing here.
+            if (graph_capture_ceiling != 0 &&
+                graph_profile_missing(ordinary_graphs,
+                                      static_cast<std::uint32_t>(lanes.size()),
+                                      maximum_frontier)) {
+                (void)cudaStreamSynchronize(device.stream);
+                extend_ordinary_graphs(static_cast<std::uint32_t>(lanes.size()),
+                                       maximum_frontier);
+            }
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
@@ -11287,7 +11853,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
-        ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
@@ -11404,7 +11970,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             .timing     = timing.finish(),
         };
     } catch (...) {
-        timing.begin_wait();
+            timing.begin_wait();
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
@@ -11420,13 +11986,218 @@ runtime::BatchedGeneratedRound
 ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
                             std::span<const runtime::RoundBudget> budgets,
                             runtime::ExecutionTiming* failed_timing) {
+    // Cold-pool maintenance at the round boundary (window policy only).
+    // Every active sequence maintains its own retired prefix; multi-lane
+    // batches compress each lane's pages independently.
+    if (cold_policy == ColdPolicy::Window) {
+        for (const std::uint32_t lane : lanes) {
+            SequenceState& sequence = active_sequence(lane);
+            if (sequence.kv) {
+                enqueue_cold_compressions(sequence);
+            }
+        }
+    }
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         return decode_mtp_batch(lanes, budgets, failed_timing);
     }
+    if (speculative_backend == SpeculativeBackend::DFlash2) {
+        return decode_dflash2_batch(lanes, budgets, failed_timing);
+    }
     return decode_dflash_batch(lanes, budgets, failed_timing);
+}
+
+runtime::BatchedGeneratedRound
+ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
+                                      std::span<const runtime::RoundBudget> budgets,
+                                      runtime::ExecutionTiming* failed_timing) {
+    if (speculative_backend != SpeculativeBackend::DFlash2 || !io.dflash_decode || !dflash2) {
+        throw std::logic_error("DFlash2 batch execution requires the DFlash2 backend");
+    }
+    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
+        throw std::invalid_argument("DFlash2 batch membership is invalid");
+    }
+
+    const std::uint32_t width           = draft_window + 1U;
+    std::uint32_t maximum_frontier      = 0;
+    std::uint32_t maximum_target_tokens = 1;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency ||
+            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+            throw std::invalid_argument("DFlash2 batch contains an invalid or duplicate lane");
+        }
+        const SequenceState& sequence = active_sequence(lane);
+        const RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Active ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
+            text_kv_addresses->bound_row(sequence.kv->text) < 0 || sequence.execution_frontier >= capacity ||
+            sequence.text_kv_valid != sequence.execution_frontier ||
+            sequence.dflash_context_frontier > sequence.execution_frontier ||
+            sequence.execution_frontier - sequence.dflash_context_frontier > width ||
+            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+            sequence.ledger.size() != sequence.ledger_frontier ||
+            sequence.prefix_identity.size() != sequence.ledger_frontier) {
+            throw std::logic_error("DFlash2 batch row is not decode-ready");
+        }
+        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                ? budgets[row].generated_tokens_remaining - 1U
+                                                : 0U;
+        // Length demotion (measured on the 32GiB 5090, threshold 20480):
+        // past ~17-20k prompt tokens the DFlash2 advantage over flat MTP
+        // disappears (~+2.6% at 15k), so lanes beyond the threshold draft
+        // nothing this round (dense single-token round through the same
+        // kernel/graph machinery as the spec-degrade fallback). The target
+        // KV cache is shared, so the row stays decode-ready; a fresh request
+        // below the threshold simply drafts again.
+        const bool lane_beyond_demote =
+            sequence.execution_frontier > qwen3_6::kSpecDemoteTokens;
+        const std::uint32_t extent =
+            lane_beyond_demote
+                ? 0U
+                : std::min({draft_window, max_by_budget,
+                            capacity - sequence.execution_frontier - 1U});
+        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+        maximum_target_tokens =
+            std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
+    }
+
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    const auto started = Clock::now();
+    try {
+        std::optional<nvtx::ScopedRange> submit_range;
+        submit_range.emplace(nvtx::Name::DecodeDFlashSubmit, nvtx::Category::DFlash,
+                             static_cast<std::uint64_t>(lanes.size()));
+        DecodeGraphExecutable* executable   = nullptr;
+        schedule::DFlash2Envelopes envelopes = dflash2_envelopes(0, maximum_frontier, draft_window);
+        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        if (use_cuda_graph) {
+            DecodeGraphProfile& profile =
+                select_graph_profile(dflash2_graphs, static_cast<std::uint32_t>(lanes.size()),
+                                     maximum_frontier, "DFlash2 batch");
+            executable      = &install_graph_profile(dflash2_graphs, profile, "DFlash2 batch");
+            envelopes       = dflash2_envelopes(profile.min_execution_frontier,
+                                                profile.max_execution_frontier, draft_window);
+            target_envelope = {
+                1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                       capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
+                                     draft_window + 1ULL))};
+        }
+
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence           = active_sequence(lanes[row]);
+            const RequestControl& request     = requests[lanes[row]];
+            const std::uint32_t frontier      = sequence.execution_frontier;
+            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                    ? budgets[row].generated_tokens_remaining - 1U
+                                                    : 0U;
+            const std::uint32_t extent =
+                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+            dflash2_host_ingress->anchors[row] = sequence.ledger.back();
+            dflash2_host_ingress->execution_frontiers[row] =
+                checked_i32(frontier, "DFlash2 batch frontier");
+            dflash2_host_ingress->context_frontiers[row] =
+                checked_i32(sequence.dflash_context_frontier, "DFlash2 context frontier");
+            dflash2_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
+            dflash2_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
+            dflash2_host_ingress->text_kv_table_rows[row] =
+                text_kv_addresses->bound_row(sequence.kv->text);
+            dflash2_host_ingress->dflash_kv_table_rows[row] = 0;
+            dflash2_host_ingress->active_lanes[row] = static_cast<std::int32_t>(sequence.lane);
+            dflash2_host_ingress->sampling[row]     = request.sampling_host;
+            // DFlash2 owns no backend KV; only the shared text cache materializes.
+            materialize_sequence_kv(sequence, frontier + extent + 1U, 0);
+        }
+
+        schedule::DFlash2BatchContext schedule_state{
+            {device, model, work, state_images->linear(),
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             proposal_head},
+            decoder->text_kv,
+            *dflash2,
+            *io.dflash_decode,
+            *dflash2_host_ingress,
+            *dflash2_host_egress,
+            state_images->continuation_hidden_store()};
+
+        mark_workspace_usage(workspace_plan.dflash2_round);
+        schedule::dflash2_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                       draft_window, envelopes, target_envelope, executable);
+        submit_range.reset();
+        timing.begin_wait();
+        {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
+            device.synchronize();
+        }
+        timing.end_wait();
+
+        const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence       = active_sequence(lanes[row]);
+            RequestControl& request       = requests[lanes[row]];
+            const std::uint32_t base_E    = sequence.execution_frontier;
+            const std::uint32_t base_S    = sequence.ledger_frontier;
+                    const std::int32_t count_i    = dflash2_host_egress->licensed_counts[row];
+            const std::int32_t accepted_i = dflash2_host_egress->accepted_drafts[row];
+                    const std::uint32_t extent =
+                static_cast<std::uint32_t>(dflash2_host_egress->proposal_extents[row]);
+                    if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
+                accepted_i + 1 != count_i || accepted_i > static_cast<std::int32_t>(extent) ||
+                extent > width ||
+                extent > static_cast<std::uint32_t>(dflash2_host_ingress->proposal_extents[row]) ||
+                static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
+                static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
+                    capacity) {
+                throw std::runtime_error("DFlash2 batch returned invalid row metadata");
+            }
+            const std::span<const TokenId> row_tokens(dflash2_host_egress->licensed_tokens.data() +
+                                                          row * width,
+                                                      static_cast<std::size_t>(count_i));
+            validate_licensed_tokens(row_tokens);
+            if (extent == 0) {
+                request.speculative_stats.fallback_steps += 1;
+            } else {
+                request.speculative_stats.rounds += 1;
+                request.speculative_stats.drafted_tokens += extent;
+                request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
+                for (std::int32_t i = 0; i < accepted_i; ++i) {
+                    request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
+                        1;
+                }
+            }
+            sequence.dflash_context_frontier = base_E;
+            request.pending                  = PendingCandidate{
+                                 .kind          = PendingKind::Speculative,
+                                 .base_E        = base_E,
+                                 .base_S        = base_S,
+                                 .prompt_tokens = 0,
+                                 .produced      = static_cast<std::uint32_t>(count_i),
+            };
+            request.lifecycle = Lifecycle::Pending;
+            request.timings.decode_seconds += seconds;
+        }
+            return runtime::BatchedGeneratedRound{
+            .tokens     = std::span<const TokenId>(dflash2_host_egress->licensed_tokens.data(),
+                                                   lanes.size() * width),
+            .row_counts = std::span<const std::int32_t>(dflash2_host_egress->licensed_counts.data(),
+                                                        lanes.size()),
+            .row_stride = width,
+        };
+    } catch (...) {
+            timing.begin_wait();
+        try {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
+                                         static_cast<std::uint64_t>(lanes.size()));
+            device.synchronize();
+        } catch (...) {}
+        timing.end_wait();
+        clear_execution_failure_lanes(lanes);
+        throw;
+    }
 }
 
 runtime::ExecutionTiming

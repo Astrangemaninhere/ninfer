@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/speculative_options.h"
+#include "product/kv_options.h"
 
 #include <cerrno>
 #include <cmath>
@@ -78,14 +79,16 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--cold-policy none|off|window|host] [--cold-keep-tokens N]\n"
+           "       [--cold-host-bytes N[g|m|k]]\n"
+           "       [--no-cuda-graph] [--graph-capture-ceiling N]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -134,7 +137,10 @@ Options parse_options(int argc, char** argv) {
             options.device = parse_device(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
-        } else if (arg == "--spec") {
+                } else if (arg == "--kv-layer-storage") {
+            options.kv_layer_storage_spec = value(arg);
+            options.kv_layer_storage_explicit = true;
+} else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
@@ -152,8 +158,23 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--cold-policy") {
+            const std::string v = value(arg);
+            if (v == "none" || v == "off") { options.cold_policy = ColdPolicy::None; }
+            else if (v == "window") { options.cold_policy = ColdPolicy::Window; }
+            else if (v == "host") { options.cold_policy = ColdPolicy::Host; }
+            else { throw std::invalid_argument("invalid cold-policy: " + v); }
+            options.cold_keep_tokens = 128;
+        } else if (arg == "--cold-keep-tokens") {
+            options.cold_keep_tokens = parse_u32(value(arg), "cold-keep-tokens");
+        } else if (arg == "--cold-host-bytes") {
+            options.cold_host_bytes = parse_u32(value(arg), "cold-host-bytes");
+        } else if (arg == "--graph-capture-ceiling") {
+            options.graph_capture_ceiling = parse_u32(value(arg), "graph-capture-ceiling");
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--yarn") {
+            options.yarn_enabled = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -207,8 +228,8 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
-        options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        options.kv_capacity.explicit_tokens == 0) {
+        throw std::invalid_argument("--kv-capacity must be positive");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {

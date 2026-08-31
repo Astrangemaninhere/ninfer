@@ -14,6 +14,10 @@
 #include "targets/qwen3_6/impl/runtime/instantiate.h"
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
+std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
+    return {};  // no per-layer calibration prior for this target
+}
+
 namespace {
 
 std::vector<GraphExecutionProfile>
@@ -123,6 +127,10 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
     }
     return profiles;
 }
+std::vector<GraphExecutionProfile> Variant::dflash2_graph_profiles(std::uint32_t, std::uint32_t, std::uint32_t) {
+    return {};
+}
+
 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,

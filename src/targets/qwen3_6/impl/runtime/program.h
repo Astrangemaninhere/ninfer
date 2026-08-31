@@ -12,6 +12,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
@@ -453,6 +454,18 @@ struct SequenceState {
     std::vector<std::uint32_t> shared_prefix_references;
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
+
+    // Cold-pool bookkeeping: text pages currently detached into raw cold
+    // slots (logical page -> slot). Released with the sequence or when the
+    // rewrite path warms the prefix back into physical pages.
+    struct ColdPageEntry {
+        std::uint32_t page;
+        std::int32_t slot;
+    };
+    std::vector<ColdPageEntry> cold_pages;
+    // First logical page not yet offered to the cold pool; compression scans
+    // forward from here so each round only visits the newly retired pages.
+    std::uint32_t cold_frontier = 0;
 };
 
 struct SharedPrefixState {
@@ -655,6 +668,7 @@ public:
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
+    std::optional<DFlash2PersistentState> dflash2;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
@@ -672,6 +686,7 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+    DecodeGraphFamily dflash2_graphs;
 
     PinnedHostBuffer round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -685,8 +700,28 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    std::optional<PinnedHostBuffer> dflash2_host;
+    qwen3_6::DFlashDecodeIngress* dflash2_host_ingress = nullptr;
+    qwen3_6::DFlashDecodeEgress* dflash2_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
+
+    // Cold-pool maintenance (rev 2b): staging + per-step compress pass.
+    ColdPolicy cold_policy      = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    void* cold_requant_codes       = nullptr;
+    void* cold_requant_scales      = nullptr;
+    std::uint32_t cold_requant_heads = 0;
+    void enqueue_cold_compressions(SequenceState& sequence);
+    void warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page);
+    void restore_cold_page(SequenceState& sequence, std::uint32_t page, std::int32_t slot,
+                           const DeviceKVPageHandle& physical);
+
+    // On-demand graph capture state (see DecodeGraphFamily comment).
+    std::uint32_t graph_capture_ceiling = 0;
+    void extend_ordinary_graphs(std::uint32_t batch_size, std::uint32_t frontier);
+    schedule::ExecutionCore make_execution_core();
     std::size_t vision_handoff_peak_bytes    = 0;
 
 private:
@@ -1162,6 +1197,10 @@ private:
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_dflash2_batch(std::span<const std::uint32_t> lanes,
+                         std::span<const runtime::RoundBudget> budgets,
+                         runtime::ExecutionTiming* failed_timing);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);

@@ -108,8 +108,8 @@ private:
 
 class ScopedEnvelope {
 public:
-    ScopedEnvelope(const ops::CausalAttentionExecutionEnvelope*& slot,
-                   const ops::CausalAttentionExecutionEnvelope& envelope)
+    ScopedEnvelope(const ops::GqaExecutionEnvelope*& slot,
+                   const ops::GqaExecutionEnvelope& envelope)
         : slot_(slot) {
         slot_ = &envelope;
     }
@@ -120,7 +120,7 @@ public:
     ~ScopedEnvelope() { slot_ = nullptr; }
 
 private:
-    const ops::CausalAttentionExecutionEnvelope*& slot_;
+    const ops::GqaExecutionEnvelope*& slot_;
 };
 
 template <class T>
@@ -359,7 +359,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
 
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                                    const Tensor& rope_positions,
-                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   ops::GqaExecutionEnvelope envelope,
                                    Tensor& mtp_hidden) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -382,7 +382,11 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
     ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    if (ctx_.yarn_enabled) {
+        ops::rope_yarn4(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    } else {
+        ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     if (active_sequence_batch_ != 0) {
@@ -396,13 +400,13 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
-        ops::causal_softmax_attention(
+        ops::gqa_attention(
             q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-            *active_backend_kv_table_rows_, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+            *active_backend_kv_table_rows_, kAttnScale,
             batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
     } else {
-        ops::causal_softmax_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
-                                      {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
+                                      kAttnScale,
                                       batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
@@ -426,7 +430,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
 void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                    const Tensor& rope_positions,
-                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   ops::GqaExecutionEnvelope envelope,
                                    Tensor& mtp_hidden, const Tensor* input_embeddings) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     nvtx::ScopedRange forward_range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
@@ -441,7 +445,7 @@ void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
 void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                     const Tensor* input_embeddings, const Tensor& positions,
                                     const Tensor& rope_positions,
-                                    ops::CausalAttentionExecutionEnvelope envelope,
+                                    ops::GqaExecutionEnvelope envelope,
                                     bool final_chunk, Tensor* final_hidden, Tensor* logits,
                                     Tensor* draft_token) {
     if (!mtp_kv_.valid()) { throw std::runtime_error("MTP prefill is not enabled"); }
@@ -492,8 +496,12 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
+        if (ctx_.yarn_enabled) {
+        ops::rope_yarn4(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
+    } else {
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
-        ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+    }
+        ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -532,11 +540,15 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
         }
+        if (ctx_.yarn_enabled) {
+        ops::rope_yarn4(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
+    } else {
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
+    }
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::causal_softmax_attention_cached(qn, last_position,
-                                             {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+        ops::gqa_attention_cached(qn, last_position,
+                                             kAttnScale,
                                              mtp_kv_.layer_view(0), envelope, work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
@@ -577,7 +589,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
 
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& positions,
-                                    ops::CausalAttentionExecutionEnvelope envelope,
+                                    ops::GqaExecutionEnvelope envelope,
                                     Tensor& mtp_hidden, int logits_column, Tensor* logits,
                                     Tensor* draft_token, const Tensor* explicit_rope_positions,
                                     const Tensor* input_embeddings) {
@@ -624,7 +636,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
 
 void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                                       const Tensor& position,
-                                      ops::CausalAttentionExecutionEnvelope envelope,
+                                      ops::GqaExecutionEnvelope envelope,
                                       Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
@@ -647,7 +659,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                         const Tensor& rope_positions, const Tensor& kv_table_rows,
                                         const Tensor& linear_state_source_slots,
                                         const Tensor& linear_state_destination_slots,
-                                        ops::CausalAttentionExecutionEnvelope envelope,
+                                        ops::GqaExecutionEnvelope envelope,
                                         Tensor& hidden, Tensor& logits) {
     const std::int32_t batch = ids.ne[0];
     if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
@@ -693,7 +705,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            const Tensor& linear_state_source_slots,
-                                           ops::CausalAttentionExecutionEnvelope envelope,
+                                           ops::GqaExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                            Tap& tap) {
     const std::int32_t width = ids.ne[0];
@@ -753,7 +765,7 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
-                                      ops::CausalAttentionExecutionEnvelope envelope,
+                                      ops::GqaExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
@@ -765,7 +777,7 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
-                                      ops::CausalAttentionExecutionEnvelope envelope,
+                                      ops::GqaExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
@@ -777,7 +789,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                                            const Tensor& cache_positions,
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                           ops::CausalAttentionExecutionEnvelope envelope,
+                                           ops::GqaExecutionEnvelope envelope,
                                            Tensor& mtp_hidden) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
@@ -845,7 +857,11 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    if (ctx_.yarn_enabled) {
+        ops::rope_yarn4(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    } else {
+        ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
@@ -861,13 +877,13 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
-                                      kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
+        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid,
+                                      kv_table_rows, 
                                       kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                                       *active_causal_attention_envelope_, work_, a_batch, s);
     } else {
-        ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
-                                      {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+                                      kAttnScale,
                                       batch_text_kv_->batch_layer_view(fidx),
                                       *active_causal_attention_envelope_, work_, a, s);
     }
@@ -1168,7 +1184,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
             const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
-            const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
+            const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
@@ -1270,7 +1286,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         Tensor next_token     = io_.mtp->draft_tokens.slice(0, i, 1);
                         Tensor next_hidden    = work_.alloc(DType::BF16, {kCfg.hidden, 1});
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
-                        const ops::CausalAttentionExecutionEnvelope ar_envelope{ar_visible,
+                        const ops::GqaExecutionEnvelope ar_envelope{ar_visible,
                                                                                 ar_visible};
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
                                             ar_envelope, next_hidden, logits, next_token);

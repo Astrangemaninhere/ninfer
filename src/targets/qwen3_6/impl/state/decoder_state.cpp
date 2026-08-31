@@ -1,6 +1,9 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
+#include "ninfer/ops/cold_i8.h"
+#include "ninfer/ops/entropy_nvfp4_slot.h"
 
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -14,37 +17,89 @@ std::uint32_t page_count(std::uint32_t capacity) {
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
-                              std::int32_t quant_group, std::int32_t table_rows,
-                              std::uint32_t physical_page_groups) {
+                              std::int32_t quant_group, std::span<const DType> layer_dtypes,
+                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
-    const bool scaled = dtype == DType::I8 || dtype == DType::FP8_E4M3FN;
-    const bool valid_profile =
-        (dtype == DType::BF16 && quant_group == 0) ||
-        (dtype == DType::I8 && quant_group == kKvInt8QuantGroup && head_dim % quant_group == 0) ||
-        (dtype == DType::FP8_E4M3FN && head_dim == kKvFp8QuantGroup &&
-         quant_group == kKvFp8QuantGroup);
-    if (!valid_profile) {
-        throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
+    if (!layer_dtypes.empty() && layer_dtypes.size() < layers) {
+        throw std::invalid_argument("Paged KV per-layer dtype table is shorter than the layer count");
+    }
+    // Per-layer resolution: BF16 entries inherit the global dtype. Accepted
+    // per-layer storages are the quantized codecs with their native group.
+    const auto layer_dtype = [&](std::uint32_t layer) {
+        const DType override_dtype = layer_dtypes.empty() ? DType::BF16 : layer_dtypes[layer];
+        const DType selected = override_dtype == DType::BF16 ? dtype : override_dtype;
+        if (selected != DType::BF16 && selected != DType::I8 && selected != DType::NVFP4 &&
+            selected != DType::FP8_E4M3FN) {
+            throw std::invalid_argument("Paged KV per-layer dtype is invalid");
+        }
+        return selected;
+    };
+    const auto layer_quant_group = [&](DType selected) {
+        return selected == DType::I8
+                   ? kKvInt8QuantGroup
+                   : (selected == DType::BF16
+                          ? 0
+                          : (selected == DType::FP8_E4M3FN ? kKvFp8QuantGroup
+                                                           : kNvfp4KvQuantGroup));
+    };
+    (void)quant_group;
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const DType selected = layer_dtype(layer);
+        if (selected != DType::BF16) {
+            const std::int32_t group = layer_quant_group(selected);
+            if (head_dim % group != 0) {
+                throw std::invalid_argument("Paged KV per-layer quantization is invalid");
+            }
+        }
     }
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
-        throw std::invalid_argument("Paged KV physical pages are below logical capacity");
+    // An explicit --kv-capacity may floor the device page pool below max_context:
+    // the rope domain (4x under YaRN) can exceed the pool, and the cold pool
+    // recycles committed pages under pressure so the context keeps growing.
+    if (physical_page_groups == 0) {
+        throw std::invalid_argument("Paged KV physical page capacity is zero");
     }
 
     KVPageGeometry geometry;
-    geometry.planes.reserve(static_cast<std::size_t>(layers) * (scaled ? 4ULL : 2ULL));
+    geometry.planes.reserve(static_cast<std::size_t>(layers) * 4ULL);
+    std::array<DType, 16> stored{};
+    std::array<std::uint32_t, 16> plane_base{};
+    std::uint32_t plane_cursor = 0;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        geometry.planes.push_back({dtype, head_dim, kv_heads, 256});
-        geometry.planes.push_back({dtype, head_dim, kv_heads, 256});
-        if (scaled) {
-            geometry.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
-            geometry.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+        const DType selected = layer_dtype(layer);
+        stored[layer]        = selected;
+        plane_base[layer]    = plane_cursor;
+        const std::int32_t group = layer_quant_group(selected);
+        if (selected == DType::BF16) {
+            geometry.planes.push_back({DType::BF16, head_dim, kv_heads, 256});
+            geometry.planes.push_back({DType::BF16, head_dim, kv_heads, 256});
+        } else if (selected == DType::I8) {
+            geometry.planes.push_back({DType::I8, head_dim, kv_heads, 256});
+            geometry.planes.push_back({DType::I8, head_dim, kv_heads, 256});
+            geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
+            geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
+        } else if (selected == DType::FP8_E4M3FN) {
+            geometry.planes.push_back({DType::FP8_E4M3FN, head_dim, kv_heads, 256});
+            geometry.planes.push_back({DType::FP8_E4M3FN, head_dim, kv_heads, 256});
+            // FP8 per-group scales are FP16 in the production codecs; the
+            // attention kernels require FP16 scale planes.
+            geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
+            geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
+        } else {
+            // NVFP4 tier: K keeps E2M1 packed codes with per-16 E4M3FN scales;
+            // V stores ISO3 sign-magnitude nibbles in the same plane geometry
+            // (semantic split via v_dtype, no extra payload).
+            geometry.planes.push_back({DType::U8, head_dim / 2, kv_heads, 256});
+            geometry.planes.push_back({DType::U8, head_dim / 2, kv_heads, 256});
+            geometry.planes.push_back({DType::FP8_E4M3FN, head_dim / group, kv_heads, 256});
+            geometry.planes.push_back({DType::FP8_E4M3FN, head_dim / group, kv_heads, 256});
         }
+        plane_cursor += selected == DType::BF16 ? 2U : 4U;
     }
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
@@ -59,6 +114,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .head_dim    = head_dim,
         .dtype       = dtype,
         .quant_group = quant_group,
+        .layer_dtypes = stored,
+        .layer_plane_base = plane_base,
     };
 }
 
@@ -66,13 +123,37 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
+    const std::span<const DType> layer_dtypes(spec.layer_kv_dtypes.data(),
+                                              spec.full_attention_layers);
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                spec.kv_table_rows, spec.text_physical_page_groups);
+                                layer_dtypes, spec.kv_table_rows,
+                                spec.text_physical_page_groups);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                   spec.kv_table_rows, spec.mtp_physical_page_groups);
+                                   {}, spec.kv_table_rows, spec.mtp_physical_page_groups);
+    }
+    // Cold pool slots: one fixed-size slot per (page, kv_head, plane). The
+    // INT8 tier packs requantized E2M1 nibbles into 9232 B raw slots; the
+    // NVFP4 tier rANS-encodes the same geometry into slots with a 320 B
+    // header, 32 x 256 B stream budget, and a 1024 B scale tail. One buffer
+    // size serves both: 9536 B covers the rANS max; the raw I8 layout keeps
+    // its offsets from slot start and simply leaves the tail unused.
+    const std::int32_t slot_bytes = ops::kEntropyNvfp4SlotBytes;
+    if (spec.max_cold_pages != 0) {
+        const std::uint32_t cold_pages = spec.max_cold_pages;
+        layout.text_kv.slot_bytes = slot_bytes;
+        layout.text_kv.max_cold_pages  = spec.max_cold_pages;
+        for (std::uint32_t layer = 0; layer < spec.full_attention_layers; ++layer) {
+            layout.text_kv.cold_slots[layer] = builder.add_tensor(
+                DType::U8, {slot_bytes, static_cast<std::uint32_t>(spec.kv_heads),
+                             2, cold_pages},
+                256, "cold slots L" + std::to_string(layer));
+            layout.text_kv.cold_slot_valid[layer] = builder.add_tensor(
+                DType::I32, {static_cast<std::uint32_t>(spec.kv_heads), 2, cold_pages}, 256,
+                "cold slot valid L" + std::to_string(layer));
+        }
     }
     return layout;
 }
@@ -80,10 +161,37 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
-      head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group) {}
+      head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group),
+      slot_bytes_(layout.slot_bytes), max_cold_pages_(layout.max_cold_pages),
+      layer_dtypes_(layout.layer_dtypes), layer_plane_base_(layout.layer_plane_base) {
+    cold_slot_used_.assign(max_cold_pages_, 0);
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        if (layout.cold_slots[layer].region.bytes != 0) {
+            cold_slots_[layer] = layout.cold_slots[layer].bind(backing);
+            cold_slot_valid_[layer] = layout.cold_slot_valid[layer].bind(backing);
+        }
+    }
+}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
+
+std::int32_t PagedKVCache::allocate_cold_slot() noexcept {
+    if (max_cold_pages_ == 0) { return -1; }
+    for (std::uint32_t slot = 0; slot < max_cold_pages_; ++slot) {
+        if (!cold_slot_used_[slot]) {
+            cold_slot_used_[slot] = true;
+            return static_cast<std::int32_t>(slot);
+        }
+    }
+    return -1;
+}
+
+void PagedKVCache::release_cold_slot(std::int32_t slot) noexcept {
+    if (slot >= 0 && static_cast<std::uint32_t>(slot) < max_cold_pages_) {
+        cold_slot_used_[slot] = false;
+    }
+}
 
 std::uint32_t PagedKVCacheView::max_context() const noexcept {
     return cache_ == nullptr ? 0 : cache_->max_context();
@@ -103,37 +211,89 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN;
-    const std::size_t stride = scaled ? 4ULL : 2ULL;
-    const std::size_t base   = static_cast<std::size_t>(layer) * stride;
+    // The scaled/stride decision follows the layer's resolved dtype so a
+    // per-layer table (PR1) can mix quantized and BF16 layers in one pool.
+    const DType layer_dtype =
+        layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer];
+    const bool scaled = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN ||
+                        layer_dtype == DType::NVFP4;
+    const std::size_t base   = layer_plane_base_.empty()
+                                    ? static_cast<std::size_t>(layer) * (scaled ? 4ULL : 2ULL)
+                                    : layer_plane_base_[layer];
     return PagedKVLayerView{
         .k_pages       = pages_.plane(base),
         .v_pages       = pages_.plane(base + 1),
         .k_scale_pages = scaled ? pages_.plane(base + 2) : Tensor(),
         .v_scale_pages = scaled ? pages_.plane(base + 3) : Tensor(),
         .block_table   = block_table,
+        .cold_slots    = cold_slots_[layer],
+        .cold_slot_valid = cold_slot_valid_[layer],
+        .slot_bytes = slot_bytes_,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
-        .dtype         = dtype_,
-        .quant_group   = quant_group_,
+        .layer_index   = static_cast<std::int32_t>(layer),
+        .dtype         = layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer],
+        .quant_group   = layer_dtypes_.empty()
+                             ? quant_group_
+                             : (layer_dtypes_[layer] == DType::I8
+                                    ? kKvInt8QuantGroup
+                                    : (layer_dtypes_[layer] == DType::FP8_E4M3FN
+                                           ? kKvFp8QuantGroup
+                                           : (layer_dtypes_[layer] == DType::NVFP4
+                                                  ? kNvfp4KvQuantGroup
+                                                  : 0))),
+        .v_dtype       = layer_dtypes_.empty()
+                             ? dtype_
+                             : (layer_dtypes_[layer] == DType::NVFP4 ? DType::ISO3
+                                                                   : layer_dtypes_[layer]),
+        .v_quant_group = layer_dtypes_.empty()
+                             ? quant_group_
+                             : (layer_dtypes_[layer] == DType::NVFP4 ? kNvfp4KvQuantGroup
+                                                                   : 0),
     };
 }
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN;
-    const std::size_t stride = scaled ? 4ULL : 2ULL;
-    const std::size_t base   = static_cast<std::size_t>(layer) * stride;
+    // The scaled/stride decision follows the layer's resolved dtype so a
+    // per-layer table (PR1) can mix quantized and BF16 layers in one pool.
+    const DType layer_dtype =
+        layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer];
+    const bool scaled = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN ||
+                        layer_dtype == DType::NVFP4;
+    const std::size_t base   = layer_plane_base_.empty()
+                                    ? static_cast<std::size_t>(layer) * (scaled ? 4ULL : 2ULL)
+                                    : layer_plane_base_[layer];
     return PagedKVBatchLayerView{
         .k_pages       = pages_.plane(base),
         .v_pages       = pages_.plane(base + 1),
         .k_scale_pages = scaled ? pages_.plane(base + 2) : Tensor(),
         .v_scale_pages = scaled ? pages_.plane(base + 3) : Tensor(),
         .block_tables  = execution_tables_.matrix(),
+        .cold_slots    = cold_slots_[layer],
+        .cold_slot_valid = cold_slot_valid_[layer],
+        .slot_bytes = slot_bytes_,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
-        .dtype         = dtype_,
-        .quant_group   = quant_group_,
+        .layer_index   = static_cast<std::int32_t>(layer),
+        .dtype         = layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer],
+        .quant_group   = layer_dtypes_.empty()
+                             ? quant_group_
+                             : (layer_dtypes_[layer] == DType::I8
+                                    ? kKvInt8QuantGroup
+                                    : (layer_dtypes_[layer] == DType::FP8_E4M3FN
+                                           ? kKvFp8QuantGroup
+                                           : (layer_dtypes_[layer] == DType::NVFP4
+                                                  ? kNvfp4KvQuantGroup
+                                                  : 0))),
+        .v_dtype       = layer_dtypes_.empty()
+                             ? dtype_
+                             : (layer_dtypes_[layer] == DType::NVFP4 ? DType::ISO3
+                                                                   : layer_dtypes_[layer]),
+        .v_quant_group = layer_dtypes_.empty()
+                             ? quant_group_
+                             : (layer_dtypes_[layer] == DType::NVFP4 ? kNvfp4KvQuantGroup
+                                                                   : 0),
     };
 }
 

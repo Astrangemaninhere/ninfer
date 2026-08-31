@@ -1,6 +1,7 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
+#include "serve/console_log.h"
 #include "serve/translate.h"
 
 #include <algorithm>
@@ -234,10 +235,16 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.kv_layer_storage         = options_.kv_layer_storage;
+    engine_options.kv_layer_storage_explicit = options_.kv_layer_storage_explicit;
     engine_options.enable_vision            = options_.enable_vision;
+    engine_options.yarn_enabled             = options_.yarn_enabled;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
+    engine_options.cold_policy              = options_.cold_policy;
+    engine_options.cold_keep_tokens         = options_.cold_keep_tokens;
+    engine_options.cold_host_bytes          = options_.cold_host_bytes;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
@@ -450,10 +457,17 @@ void GenerationService::warmup() {
     turn.content.push_back(std::move(content));
     request.messages.push_back(std::move(turn));
     request.max_tokens = 4;
-    PreparedRequest prepared =
-        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {},
-                     CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
-    run(prepared, nullptr);
+    // The warmup is advisory: a failed round must not take the server down,
+    // the first real request surfaces the real error instead.
+    try {
+        PreparedRequest prepared =
+            prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {},
+                         CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
+        run(prepared, nullptr);
+    } catch (const std::exception& exception) {
+        write_console_log(ConsoleLogLevel::Warning,
+                          std::string("warmup failed (continuing): ") + exception.what());
+    }
 }
 
 } // namespace ninfer::serve

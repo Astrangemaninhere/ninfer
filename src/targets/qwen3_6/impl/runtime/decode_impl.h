@@ -10,7 +10,7 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
 auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
-                         ops::CausalAttentionExecutionEnvelope envelope) {
+                         ops::GqaExecutionEnvelope envelope) {
     return [&state, batch_size, envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency)) {
             throw std::logic_error("ordinary decode batch state is incomplete");
@@ -51,14 +51,14 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 } // namespace
 
 void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   ops::GqaExecutionEnvelope envelope,
                                    DecodeGraphDefinition& definition) {
     auto body = ordinary_batch_body(state, batch_size, envelope);
     capture_graph(state, definition, body);
 }
 
 void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
-                           ops::CausalAttentionExecutionEnvelope envelope,
+                           ops::GqaExecutionEnvelope envelope,
                            DecodeGraphExecutable* executable) {
     auto body = ordinary_batch_body(state, batch_size, envelope);
     run_prepared(state, executable, body);

@@ -95,15 +95,39 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-dflash2") {
+        return WeightsProfile::Qwen38Nvfp4DFlash2;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
+EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
+                                                    WeightsProfile weights_profile) {
+    EngineOptions resolved = options;
+    if (options.speculative.backend != SpeculativeBackend::Auto) { return resolved; }
+    // The artifact weights decide the backend, not the context length: a
+    // DFlash2 artifact has no MTP draft head (the two are mutually
+    // exclusive), so auto must pick DFlash2 even at long contexts - a memory
+    // shortfall then surfaces as a clear reservation error instead of a
+    // confusing weights mismatch. A non-DFlash2 artifact defaults to MTP.
+    if (weights_profile == detail::WeightsProfile::Qwen38Nvfp4DFlash2 &&
+        !options.enable_vision) {
+        resolved.speculative.backend = SpeculativeBackend::DFlash2;
+        if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 7; }
+    } else {
+        resolved.speculative.backend = SpeculativeBackend::Mtp;
+        if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 3; }
+    }
+    return resolved;
+}
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    const EngineOptions resolved = Package::resolved_auto_speculative(options, weights_profile);
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(resolved))));
 }
 
 std::unique_ptr<Package::LoadedModel>

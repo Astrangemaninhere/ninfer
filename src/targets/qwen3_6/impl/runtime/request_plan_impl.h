@@ -571,6 +571,15 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                                        shared_source->backend_frontier < plan->reuse_base)))) {
         throw std::logic_error("published DFlash checkpoint is not materializable");
     }
+    if ((is_rewrite_checkpoint_restore(plan->reuse) ||
+         plan->reuse == ReusePath::PrivateLongAnchor ||
+         plan->reuse == ReusePath::SharedStablePrefix) &&
+        speculative_backend == SpeculativeBackend::DFlash2 &&
+        (!dflash2 ||
+         (source != nullptr && source->dflash_context_frontier < plan->reuse_base) ||
+         (shared_source != nullptr && shared_source->backend_frontier < plan->reuse_base))) {
+        throw std::logic_error("published DFlash2 checkpoint is not materializable");
+    }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
     const bool can_retain_rewrite =
@@ -802,6 +811,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         for (std::uint32_t page = 0; page < required; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.device_resident(logical)) { continue; }
+            // Cold-pool pages restore in place from their raw slots.
+            if (pages.cold_compressed(logical)) { continue; }
             if (!pages.host_resident(logical)) {
                 throw std::logic_error("checkpoint KV page has no restorable replica");
             }

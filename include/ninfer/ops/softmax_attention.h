@@ -13,7 +13,9 @@
 
 namespace ninfer::ops {
 
+// Native causal-attention key budget; the YaRN extension multiplies it by 4.
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
+inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeysYarn = 4 * 262144;
 
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;

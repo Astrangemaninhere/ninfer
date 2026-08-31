@@ -19,6 +19,26 @@
 #include "targets/qwen3_6/impl/runtime/instantiate.h"
 
 namespace ninfer::targets::qwen3_6_27b::detail {
+
+std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
+    // Measured on 13.3k zh perplexity at ctx 4096/8192: the 8/8 split
+    // (NVFP4 {0,1,3,4,6,7,8,9}, I8 {2,5,10-15}) scores 1.335 vs all-I8 1.432
+    // at ctx 4096 and 1.195 vs 1.250 at ctx 8192. Layers 13/14 then demote to
+    // NVFP4 for free (10L: 1.3344/1.1952, parity within noise), shrinking the
+    // page pool another 12.5%; 12L (1.345) and 14L (1.375) stay below all-I8.
+    // The budget ladder 8L->10L->12L->14L costs +0.00/+0.00/+0.01/+0.04 ppl.
+    // Layers 2 and 5 are the true sensitivity outliers: demoting either alone
+    // costs +0.20/+0.09 and the 10L "0-4,6-9,15" combo (which demotes both)
+    // degrades to 1.551. Per-layer NMSE/rank metrics (analyze_kv.py) do NOT
+    // predict these combo outcomes; the 8/8-neighborhood marginals do.
+    std::array<DType, 16> table{};
+    table.fill(DType::NVFP4);
+    for (const int layer : {2, 5, 10, 11, 12, 15}) {
+        table[static_cast<std::size_t>(layer)] = DType::I8;
+    }
+    return table;
+}
+
 namespace {
 
 std::vector<GraphExecutionProfile>
@@ -113,6 +133,37 @@ std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
     return layout.peak_bytes(1);
 }
 
+std::vector<GraphExecutionProfile>
+dflash_base_profiles(std::uint32_t capacity, std::uint32_t draft_window) {
+    if (draft_window == 0 || capacity == 0) { return {}; }
+    const std::uint32_t block        = draft_window + 1;
+    const std::uint32_t max_frontier = capacity - 1;
+    std::vector<std::uint32_t> ends{
+        96U, 127U, 511U, 1023U, 2047U, 4095U, 8191U, 16383U, 32767U, 65536U, 131072U, 196608U,
+    };
+    const auto add_target_boundary = [&](std::uint32_t visible_end) {
+        if (visible_end >= block) { ends.push_back(visible_end - block); }
+    };
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
+        add_target_boundary(visible_end);
+    }
+    if (draft_window >= 6 && draft_window <= 15) {
+        add_target_boundary(draft_window <= 11 ? 512U : 1024U);
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return graph_profiles_through(max_frontier, ends);
+}
+
+bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
+                                        std::uint32_t max_visible_keys) {
+    const std::uint32_t tokens = draft_window + 1;
+    if (tokens <= 6) { return false; }
+    if (batch_size > 1) { return true; }
+    const std::uint32_t prompt_visible_limit = tokens <= 12 ? 512U : 1024U;
+    return max_visible_keys > prompt_visible_limit;
+}
+
 } // namespace
 
 std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
@@ -153,6 +204,21 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
                                                                   std::uint32_t) {
     return {};
+}
+
+std::vector<GraphExecutionProfile> Variant::dflash2_graph_profiles(std::uint32_t capacity,
+                                                                   std::uint32_t draft_window,
+                                                                   std::uint32_t batch_size) {
+    std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
+    for (GraphExecutionProfile& profile : profiles) {
+        const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(profile.max) + draft_window + 1ULL));
+        const bool split_swa           = profile.max > 96U;
+        const bool chunked_target =
+            dflash_target_uses_chunked_small_t(draft_window, batch_size, target_max);
+        profile.topology_class = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
+    }
+    return profiles;
 }
 
 void Variant::attention_projection(const Tensor& hidden,
@@ -349,6 +415,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4DFlash2:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, kFp8TextPolicy, first, last);
     }
@@ -369,6 +436,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
                                                         TextConfig::query_size, kNvfp4TextPolicy,
                                                         first, last);
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4DFlash2:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::query_size,
                                                         kFp8TextPolicy, first, last);
@@ -389,6 +457,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4DFlash2:
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
     }
@@ -412,6 +481,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4DFlash2:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
@@ -437,6 +507,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4DFlash2:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
@@ -460,6 +531,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4DFlash2:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::value_dim,
                                                         kFp8TextPolicy, first, last);
@@ -486,6 +558,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
                                           last);
     case WeightsProfile::Qwen38Nvfp4: {
+    case WeightsProfile::Qwen38Nvfp4DFlash2:
         const std::size_t nvfp4 =
             post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);
         const std::size_t fp8 = post_mixer_workspace_bytes(

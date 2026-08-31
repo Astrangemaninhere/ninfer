@@ -40,4 +40,17 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);
 
+/**
+ * Static YaRN factor-4 rope: the Text 1-D / DFlash 1-D transformations with the yarn4 frequency
+ * tables (theta must be 1e7) and the yarn4 attention scaling 1.1386 folded into the sincos
+ * coefficients. Registered domains are Text D256/R64 (heads 24/4, 16/2) and DFlash D128/R128
+ * (32/8). Same storage contract as rope().
+ */
+void rope_yarn4(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
+                cudaStream_t stream);
+
+// Single-tensor form of rope_yarn4.
+void rope_yarn4(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
+                cudaStream_t stream);
+
 } // namespace ninfer::ops

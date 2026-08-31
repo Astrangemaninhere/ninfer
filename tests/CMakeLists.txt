@@ -44,6 +44,12 @@ function(ninfer_add_linear_test name source)
             ops/linear/linear_test_common.cpp
     LIBRARIES ninfer_ops)
 endfunction()
+ninfer_add_op_test(ninfer_entropy_cold_requant_test
+  SOURCES ops/test_entropy_cold_requant.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_cold_i8_test
+  SOURCES ops/test_cold_i8.cpp
+  LIBRARIES ninfer_ops)
 
 function(ninfer_add_fused_linear_test name source common)
   ninfer_add_op_test(${name}

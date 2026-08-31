@@ -30,11 +30,27 @@ enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
     Fp8E4M3Row256,
+    Nvfp4Group16,
+    Fp8Group16,
+    Iso3Group16,
 };
+
+// Per-layer table width shared by targets that publish per-layer KV storage.
+// Entries are indexed by full-attention layer order, not physical model layer.
+inline constexpr std::size_t kKvLayerStorageSlots = 16;
 
 enum class EnginePurpose : std::uint8_t {
     Generation,
     CausalScoring,
+};
+
+// Entropy-coded cold KV pool. Window compresses fully-written pages that
+// are at least cold_keep_tokens behind the decode frontier; attention
+// producers decode those pages inline from fixed-size slots.
+enum class ColdPolicy : std::uint8_t {
+    None,
+    Window,
+    Host,
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -69,6 +85,8 @@ enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
     DFlash,
+    DFlash2,
+    Auto,
 };
 
 struct SpeculativeOptions {
@@ -115,6 +133,12 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Per-layer KV storage override, indexed by full-attention layer order.
+    // BFloat16 entries inherit kv_cache. Any non-BFloat16 entry replaces the
+    // target's registered per-layer default table wholesale; entries outside
+    // the target's full-attention layer count are rejected.
+    std::array<KvCacheStorage, kKvLayerStorageSlots> kv_layer_storage{};
+    bool kv_layer_storage_explicit = false;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -122,8 +146,18 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    bool yarn_enabled                      = false;
+    // On-demand graph capture: 0 (default) captures the full decode ladder at
+    // startup; a positive value captures only segments fully below it and the
+    // runtime extends the family on demand as the decode frontier grows past
+    // each captured segment (one capture per growth crossing).
+    std::uint32_t graph_capture_ceiling = 0;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    ColdPolicy cold_policy            = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens    = 128;
+    // Pinned host-memory budget for ColdPolicy::Host offload. Default 4 GiB.
+    std::uint64_t cold_host_bytes     = 4ULL << 30;
     LoadProgress load_progress;
 };
 

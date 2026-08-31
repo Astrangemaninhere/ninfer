@@ -31,11 +31,24 @@ struct DFlashPersistentLayout {
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept { return full.payload_bytes(); }
 };
 
+struct DFlash2PersistentLayout {
+    CyclicKVCacheLayout local;
+    CyclicKVCacheLayout rewrite_checkpoint_local;
+    TensorLayout prefill_features;
+    TensorLayout prefill_positions;
+    TensorLayout pending_features;
+
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
+        return local.payload_bytes() + rewrite_checkpoint_local.payload_bytes();
+    }
+};
+
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     qwen3_6::StateImageDeviceLayout state_images;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
+    std::optional<DFlash2PersistentLayout> dflash2;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     std::optional<TensorLayout> score_hidden;
@@ -61,6 +74,8 @@ struct WorkspacePlan {
     std::size_t mtp_round        = 0;
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
+    std::size_t dflash2_context  = 0;
+    std::size_t dflash2_round    = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
@@ -70,16 +85,24 @@ struct WorkspacePlan {
 struct SequencePlanningInputs {
     WeightsProfile weights_profile;
     std::uint32_t capacity                 = 0;
+    // Explicit --kv-capacity page count (when set below capacity) shrinks the
+    // device page-pool floor: max_context then bounds only the rope domain.
+    std::optional<std::uint32_t> kv_capacity_tokens;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
+    std::array<DType, 16> layer_kv_dtypes{};
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    std::uint32_t graph_capture_ceiling = 0;
     bool causal_scoring = false;
+    ColdPolicy cold_policy      = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
     int device          = 0;
     ContextCacheOptions context_cache;
 };
@@ -100,9 +123,14 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
+    std::array<DType, 16> layer_kv_dtypes{};
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    ColdPolicy cold_policy      = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    std::uint32_t graph_capture_ceiling = 0;
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;

@@ -215,6 +215,7 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
+        device.yarn_enabled = options.yarn_enabled;
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);

@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/kv_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -76,7 +77,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--spec mtp|dflash --draft-tokens N] "
+           "[--cold-policy none|window|host] [--cold-keep-tokens N] "
+           "[--cold-host-bytes N[g|m|k]] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -258,6 +261,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--kv-layer-storage") {
+            const auto table = product::parse_kv_layer_storage(require_value("--kv-layer-storage"));
+            for (std::size_t i = 0; i < options.kv_layer_storage.size(); ++i) {
+                options.kv_layer_storage[i] = table[i];
+            }
+            options.kv_layer_storage_explicit = true;
+        } else if (arg == "--cold-policy") {
+            const std::string_view v = require_value("--cold-policy");
+            if (v == "none" || v == "off") { options.cold_policy = ColdPolicy::None; }
+            else if (v == "window") { options.cold_policy = ColdPolicy::Window; }
+            else if (v == "host") { options.cold_policy = ColdPolicy::Host; }
+            else { throw std::invalid_argument("invalid cold-policy: " + std::string(v)); }
+        } else if (arg == "--cold-keep-tokens") {
+            options.cold_keep_tokens =
+                parse_u64(require_value("--cold-keep-tokens"), "cold-keep-tokens");
+            if (options.cold_keep_tokens > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--cold-keep-tokens is out of range");
+            }
+        } else if (arg == "--cold-host-bytes") {
+            options.cold_host_bytes =
+                parse_u64(require_value("--cold-host-bytes"), "cold-host-bytes");
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
@@ -279,6 +303,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--yarn") {
+            options.yarn_enabled = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
@@ -332,9 +358,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
+    // An explicit --kv-capacity may floor the device page pool below max_context:
+    // YaRN extends the rope domain beyond the pool, and the cold pool recycles
+    // committed pages under pressure so the context can keep growing.
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
-        options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        options.kv_capacity.explicit_tokens == 0) {
+        throw std::invalid_argument("--kv-capacity must be positive");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
