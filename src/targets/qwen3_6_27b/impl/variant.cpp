@@ -21,14 +21,19 @@
 namespace ninfer::targets::qwen3_6_27b::detail {
 
 std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
-    // Measured per-layer NVFP4 sensitivity (13.3k zh + 11.9k en perplexity):
-    // shallow/mid layers 0,1,3,4,6,7,8,9 tolerate NVFP4 at parity-or-better
-    // vs all-INT8 (zh 1.335 vs 1.432, en 1.2025 vs 1.2034) while the dense
-    // upper layers 2,5,10-15 degrade sharply (10 NVFP4 layers -> 1.551).
-    // The 8/8 split halves the page pool with no measurable quality cost.
+    // Measured on 13.3k zh perplexity at ctx 4096/8192: the 8/8 split
+    // (NVFP4 {0,1,3,4,6,7,8,9}, I8 {2,5,10-15}) scores 1.335 vs all-I8 1.432
+    // at ctx 4096 and 1.195 vs 1.250 at ctx 8192. Layers 13/14 then demote to
+    // NVFP4 for free (10L: 1.3344/1.1952, parity within noise), shrinking the
+    // page pool another 12.5%; 12L (1.345) and 14L (1.375) stay below all-I8.
+    // The budget ladder 8L->10L->12L->14L costs +0.00/+0.00/+0.01/+0.04 ppl.
+    // Layers 2 and 5 are the true sensitivity outliers: demoting either alone
+    // costs +0.20/+0.09 and the 10L "0-4,6-9,15" combo (which demotes both)
+    // degrades to 1.551. Per-layer NMSE/rank metrics (analyze_kv.py) do NOT
+    // predict these combo outcomes; the 8/8-neighborhood marginals do.
     std::array<DType, 16> table{};
     table.fill(DType::NVFP4);
-    for (const int layer : {2, 5, 10, 11, 12, 13, 14, 15}) {
+    for (const int layer : {2, 5, 10, 11, 12, 15}) {
         table[static_cast<std::size_t>(layer)] = DType::I8;
     }
     return table;
