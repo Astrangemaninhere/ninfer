@@ -14,10 +14,10 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
-    if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
-        throw std::logic_error("DFlash prefill controls are unavailable");
-    }
     if (state.execution.model.features.dflash2()) {
+        if (!state.execution.io.dflash_decode || state.dflash2_host_ingress == nullptr) {
+            throw std::logic_error("DFlash2 prefill controls are unavailable");
+        }
         return dflash2_feature_sink(
             state, [&state](const Tensor& features, const Tensor& positions,
                             bool rewrite_checkpoint) {
@@ -29,10 +29,14 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
                 const auto exact = static_cast<std::uint32_t>(features.ne[1]);
                 dflash2_append_context(state, features, positions, count, lane, row, {exact, exact});
                 if (rewrite_checkpoint) {
-                    state.dflash2->save_rewrite_checkpoint(state.dflash_host_ingress->active_lanes[0],
-                                                           state.execution.device.stream);
+                    state.dflash2->save_rewrite_checkpoint(
+                        state.dflash2_host_ingress->active_lanes[0],
+                        state.execution.device.stream);
                 }
             });
+    }
+    if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
+        throw std::logic_error("DFlash prefill controls are unavailable");
     }
     return dflash_feature_sink(
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
@@ -80,7 +84,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
-    if (state.dflash != nullptr) {
+    if (state.dflash != nullptr || state.dflash2 != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   sink);
@@ -93,7 +97,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                                             std::uint32_t nominal_length,
                                             std::optional<std::uint32_t> split_frontier,
                                             bool finalize_at_end) {
-    if (state.dflash != nullptr) {
+    if (state.dflash != nullptr || state.dflash2 != nullptr) {
         throw std::logic_error("DFlash staged multimodal prefill is unavailable");
     }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,

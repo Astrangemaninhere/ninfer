@@ -365,6 +365,8 @@ auto dflash2_decode_batch_body(DFlash2BatchContext& state, std::int32_t batch_si
         Tensor valid_columns    = frame.target_valid_columns.slice(0, 0, batch_size);
         Tensor text_rows        = frame.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes            = frame.active_lanes.slice(0, 0, batch_size);
+        Tensor state_sources    = frame.state_source_slots.slice(0, 0, batch_size);
+        Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
         Tensor append_positions = frame.append_positions.slice(1, 0, batch_size);
         Tensor append_counts    = frame.append_counts.slice(0, 0, batch_size);
         Tensor drafts           = frame.draft_tokens.slice(1, 0, batch_size);
@@ -406,6 +408,8 @@ auto dflash2_decode_batch_body(DFlash2BatchContext& state, std::int32_t batch_si
                                  .rope_positions  = target_positions,
                                  .valid_columns   = valid_columns,
                                  .kv_table_rows   = text_rows,
+                                 .state_source_slots      = state_sources,
+                                 .state_destination_slots = state_destinations,
                                  .target_hidden   = target_hidden,
                                  .target_logits   = target_logits,
                                  .target_tokens   = target_tokens,
