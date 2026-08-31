@@ -141,11 +141,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency + 1),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
-                     .max_cold_pages            = plan.cold_policy == ColdPolicy::Window ||
-                                                          plan.cold_policy == ColdPolicy::Host
-                                                      ? plan.cold_keep_tokens / kPagedKVPageSize + 16
-                                                      : 0,
-                     .cold_host                 = plan.cold_policy == ColdPolicy::Host,
+                     .max_cold_pages            = plan.cold_policy == ColdPolicy::Window
+                                                          ? plan.cold_keep_tokens / kPagedKVPageSize + 16
+                                                          : 0,
                  });
     qwen3_6::StateImageSpec state_image_spec{
         .linear =
