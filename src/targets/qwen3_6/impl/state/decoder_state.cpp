@@ -67,9 +67,12 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     KVPageGeometry geometry;
     geometry.planes.reserve(static_cast<std::size_t>(layers) * 4ULL);
     std::array<DType, 16> stored{};
+    std::array<std::uint32_t, 16> plane_base{};
+    std::uint32_t plane_cursor = 0;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const DType selected = layer_dtype(layer);
         stored[layer]        = selected;
+        plane_base[layer]    = plane_cursor;
         const std::int32_t group = layer_quant_group(selected);
         if (selected == DType::BF16) {
             geometry.planes.push_back({DType::BF16, head_dim, kv_heads, 256});
@@ -95,6 +98,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
             geometry.planes.push_back({DType::FP8_E4M3FN, head_dim / group, kv_heads, 256});
             geometry.planes.push_back({DType::FP8_E4M3FN, head_dim / group, kv_heads, 256});
         }
+        plane_cursor += selected == DType::BF16 ? 2U : 4U;
     }
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
@@ -110,6 +114,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .dtype       = dtype,
         .quant_group = quant_group,
         .layer_dtypes = stored,
+        .layer_plane_base = plane_base,
     };
 }
 
@@ -152,7 +157,16 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group),
-      layer_dtypes_(layout.layer_dtypes) {}
+      cold_slot_bytes_(layout.cold_slot_bytes), max_cold_pages_(layout.max_cold_pages),
+      layer_dtypes_(layout.layer_dtypes), layer_plane_base_(layout.layer_plane_base) {
+    cold_slot_used_.assign(max_cold_pages_, 0);
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+        if (layout.cold_slots[layer].region.bytes != 0) {
+            cold_slots_[layer] = layout.cold_slots[layer].bind(backing);
+            cold_slot_valid_[layer] = layout.cold_slot_valid[layer].bind(backing);
+        }
+    }
+}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
@@ -197,8 +211,9 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
     const DType layer_dtype =
         layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer];
     const bool scaled        = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN;
-    const std::size_t stride = scaled ? 4ULL : 2ULL;
-    const std::size_t base   = static_cast<std::size_t>(layer) * stride;
+    const std::size_t base   = layer_plane_base_.empty()
+                                    ? static_cast<std::size_t>(layer) * (scaled ? 4ULL : 2ULL)
+                                    : layer_plane_base_[layer];
     return PagedKVLayerView{
         .k_pages       = pages_.plane(base),
         .v_pages       = pages_.plane(base + 1),
@@ -228,8 +243,9 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
     const DType layer_dtype =
         layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer];
     const bool scaled        = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN;
-    const std::size_t stride = scaled ? 4ULL : 2ULL;
-    const std::size_t base   = static_cast<std::size_t>(layer) * stride;
+    const std::size_t base   = layer_plane_base_.empty()
+                                    ? static_cast<std::size_t>(layer) * (scaled ? 4ULL : 2ULL)
+                                    : layer_plane_base_[layer];
     return PagedKVBatchLayerView{
         .k_pages       = pages_.plane(base),
         .v_pages       = pages_.plane(base + 1),
