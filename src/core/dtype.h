@@ -14,6 +14,9 @@ enum class DType : std::uint8_t {
     I8         = 5,
     FP16       = 6,
     FP8_E4M3FN = 7,
+    // Packed E2M1 nibble plane (two codes per byte) with per-16-channel
+    // E4M3FN scales; see the per-layer KV storage table.
+    NVFP4      = 8,
 };
 
 std::size_t dtype_size(DType dtype);

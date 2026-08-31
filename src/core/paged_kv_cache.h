@@ -47,6 +47,7 @@ struct PagedKVLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    std::array<DType, 16> layer_dtypes{};
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
