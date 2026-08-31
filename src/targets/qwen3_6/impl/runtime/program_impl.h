@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 #include "ninfer/ops/cold_i8.h"
 #include "ninfer/ops/entropy_cold_requant.h"
+#include "ninfer/ops/entropy_nvfp4_slot.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include "core/nvtx.h"
@@ -10385,11 +10386,11 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
 
     const std::int32_t kv_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
     const std::uint32_t layers  = decoder->text_kv.layers();
-    // Cold slots carry requantized E2M1 planes (int8 -> E2M1 g64). The page
-    // stays hot unless every layer can pack, so mixed-dtype stacks skip.
-    for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        if (decoder->text_kv.batch_layer_view(layer).dtype != DType::I8) { return; }
-    }
+    // Per-layer cold packing: INT8 planes are requantized to E2M1 g64 and
+    // stored in raw 9232 B slots; NVFP4 planes keep their native E2M1/ISO3
+    // nibbles and are rANS-encoded into entropy slots. The 9536 B slot buffer
+    // covers both formats, so mixed-dtype stacks pack per layer instead of
+    // skipping the whole cold transfer.
     std::vector<std::int32_t> k_flags(static_cast<std::size_t>(kv_heads));
     std::vector<std::int32_t> v_flags(static_cast<std::size_t>(kv_heads));
     std::uint32_t compressed = 0;
@@ -10404,10 +10405,6 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
             const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
             const Tensor cold_slots          = view.cold_slots;
             if (cold_slots.data == nullptr) { continue; }
-            if (view.dtype != DType::I8) {
-                success = false;  // cold slots only carry int8 planes
-                break;
-            }
             const DeviceKVPageHandle ph = store.physical_page(text, page);
             const std::int32_t physical = ph.index();
             auto* k_codes = static_cast<const std::uint8_t*>(view.k_pages.data) +
@@ -10425,22 +10422,49 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
                             static_cast<std::int64_t>(slot) * view.cold_slot_valid.nb[2];
             auto* v_valid = reinterpret_cast<std::int32_t*>(
                 reinterpret_cast<std::uint8_t*>(k_valid) + view.cold_slot_valid.nb[1]);
-            ops::entropy_cold_requant_raw(
-                k_codes, k_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
-                static_cast<std::uint8_t*>(cold_requant_codes),
-                static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
-            ops::cold_i8_slot_pack_raw(
-                static_cast<const std::uint8_t*>(cold_requant_codes),
-                static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
-                k_valid, device.stream);
-            ops::entropy_cold_requant_raw(
-                v_codes, v_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
-                static_cast<std::uint8_t*>(cold_requant_codes),
-                static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
-            ops::cold_i8_slot_pack_raw(
-                static_cast<const std::uint8_t*>(cold_requant_codes),
-                static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
-                v_valid, device.stream);
+            if (view.dtype == DType::I8) {
+                // INT8 tier: requant to E2M1 g64 and store the raw nibble slot.
+                ops::entropy_cold_requant_raw(
+                    k_codes, k_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::cold_i8_slot_pack_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
+                    k_valid, view.slot_bytes, device.stream);
+                ops::entropy_cold_requant_raw(
+                    v_codes, v_scales, ops::EntropyColdRequantMode::Int8G64, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::cold_i8_slot_pack_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
+                    v_valid, view.slot_bytes, device.stream);
+            } else if (view.dtype == DType::NVFP4) {
+                // NVFP4 tier: keep the native E2M1 (K) / ISO3 (V) nibbles,
+                // requantize scales to g64 for a skew that rANS compresses,
+                // and encode into the entropy slot. On incompressible pages
+                // the slot flags stay 0 and the hot plane keeps serving.
+                ops::entropy_cold_requant_raw(
+                    k_codes, k_scales, ops::EntropyColdRequantMode::Nvfp4G16, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::entropy_nvfp4_slot_encode_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, k_slot,
+                    view.slot_bytes, k_valid, nullptr, kv_heads, device.stream);
+                ops::entropy_cold_requant_raw(
+                    v_codes, v_scales, ops::EntropyColdRequantMode::Iso3VG16, kv_heads, 1,
+                    static_cast<std::uint8_t*>(cold_requant_codes),
+                    static_cast<std::uint8_t*>(cold_requant_scales), device.stream);
+                ops::entropy_nvfp4_slot_encode_raw(
+                    static_cast<const std::uint8_t*>(cold_requant_codes),
+                    static_cast<const std::uint8_t*>(cold_requant_scales), kv_heads, 1, v_slot,
+                    view.slot_bytes, v_valid, nullptr, kv_heads, device.stream);
+            } else {
+                success = false;  // bf16/fp8 layers have no cold slot codec
+                break;
+            }
         }
         if (!success) {
             decoder->text_kv.release_cold_slot(slot);
@@ -10450,6 +10474,8 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
 
         // A slot only counts once every head's pack kernel committed its valid
         // flag; otherwise the page would decode as garbage through the slot.
+        // Valid tensor is [kv_heads, 2, pages] col-major: head innermost,
+        // page outermost, so slot pages sit at slot * 2*kv_heads.
         const Tensor cold_valid = decoder->text_kv.cold_slot_valid(0);
         auto* k_valid = static_cast<std::int32_t*>(cold_valid.data) +
                         static_cast<std::int64_t>(slot) * cold_valid.nb[2];
@@ -10497,23 +10523,53 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
         const Tensor cold_slots          = view.cold_slots;
-        if (cold_slots.data == nullptr || view.dtype != DType::I8) { continue; }
-        auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
-        auto* v_slot_base = k_slot_base + cold_slots.nb[2];
-        auto* k_codes_i8 = static_cast<std::int8_t*>(view.k_pages.data) +
-                           static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
-        auto* v_codes_i8 = static_cast<std::int8_t*>(view.v_pages.data) +
-                           static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
-        auto* k_scales_h = static_cast<void*>(
-            static_cast<std::uint8_t*>(view.k_scale_pages.data) +
-            static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3]);
-        auto* v_scales_h = static_cast<void*>(
-            static_cast<std::uint8_t*>(view.v_scale_pages.data) +
-            static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3]);
-        ops::cold_i8_slot_restore_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
-                                      k_codes_i8, k_scales_h, device.stream);
-        ops::cold_i8_slot_restore_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
-                                      v_codes_i8, v_scales_h, device.stream);
+        if (cold_slots.data == nullptr) { continue; }
+        if (view.dtype == DType::NVFP4) {
+            // NVFP4 tier: rANS-decode the slot back into the native E2M1/ISO3
+            // code plane, then scatter the slot's scale tail into the plane.
+            auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
+            auto* v_slot_base = k_slot_base + cold_slots.nb[2];
+            auto* k_codes_nv = static_cast<std::uint8_t*>(view.k_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
+            auto* v_codes_nv = static_cast<std::uint8_t*>(view.v_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
+            auto* k_scales_nv = static_cast<std::uint8_t*>(view.k_scale_pages.data) +
+                                static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3];
+            auto* v_scales_nv = static_cast<std::uint8_t*>(view.v_scale_pages.data) +
+                                static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3];
+            ops::entropy_nvfp4_slot_restore_plane_raw(
+                k_slot_base + slot * cold_slots.nb[3], view.slot_bytes, 0, kv_heads,
+                static_cast<std::uint8_t*>(cold_requant_codes), k_codes_nv, device.stream);
+            ops::entropy_nvfp4_slot_restore_plane_raw(
+                v_slot_base + slot * cold_slots.nb[3], view.slot_bytes, 0, kv_heads,
+                static_cast<std::uint8_t*>(cold_requant_codes), v_codes_nv, device.stream);
+            std::int32_t page_ids[1] = {ph_index};
+            ops::entropy_nvfp4_slot_scales_scatter_raw(
+                k_slot_base + slot * cold_slots.nb[3], view.slot_bytes,
+                static_cast<int>(cold_slots.nb[3]), kv_heads, 1, page_ids,
+                static_cast<int>(view.k_scale_pages.nb[3]), k_scales_nv, device.stream);
+            ops::entropy_nvfp4_slot_scales_scatter_raw(
+                v_slot_base + slot * cold_slots.nb[3], static_cast<int>(cold_slots.nb[3]),
+                static_cast<int>(cold_slots.nb[3]) * kv_heads, kv_heads, 1, page_ids,
+                static_cast<int>(view.v_scale_pages.nb[3]), v_scales_nv, device.stream);
+        } else if (view.dtype == DType::I8) {
+            auto* k_slot_base = static_cast<std::uint8_t*>(cold_slots.data);
+            auto* v_slot_base = k_slot_base + cold_slots.nb[2];
+            auto* k_codes_i8 = static_cast<std::int8_t*>(view.k_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.k_pages.nb[3];
+            auto* v_codes_i8 = static_cast<std::int8_t*>(view.v_pages.data) +
+                               static_cast<std::int64_t>(ph_index) * view.v_pages.nb[3];
+            auto* k_scales_h = static_cast<void*>(
+                static_cast<std::uint8_t*>(view.k_scale_pages.data) +
+                static_cast<std::int64_t>(ph_index) * view.k_scale_pages.nb[3]);
+            auto* v_scales_h = static_cast<void*>(
+                static_cast<std::uint8_t*>(view.v_scale_pages.data) +
+                static_cast<std::int64_t>(ph_index) * view.v_scale_pages.nb[3]);
+            ops::cold_i8_slot_restore_raw(k_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                          k_codes_i8, k_scales_h, view.slot_bytes, device.stream);
+            ops::cold_i8_slot_restore_raw(v_slot_base + slot * cold_slots.nb[3], kv_heads, 1,
+                                          v_codes_i8, v_scales_h, view.slot_bytes, device.stream);
+        }
     }
     decoder->text_kv.release_cold_slot(slot);
     auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),

@@ -16,14 +16,15 @@ __global__ void cold_i8_slot_pack_kernel(const std::uint8_t* __restrict__ src_co
                                          const std::uint8_t* __restrict__ src_scales,
                                          int kv_heads,
                                          std::uint8_t* __restrict__ slots,
-                                         std::int32_t* __restrict__ slot_valid) {
+                                         std::int32_t* __restrict__ slot_valid,
+                                         int slot_bytes) {
     const int head = static_cast<int>(blockIdx.x);
     const int page = static_cast<int>(blockIdx.y);
     const std::int64_t plane = static_cast<std::int64_t>(head) +
                                static_cast<std::int64_t>(kv_heads) * page;
     const std::uint8_t* src_c = src_codes + plane * kColdI8SlotCodeBytes;
     const std::uint8_t* src_s = src_scales + plane * kColdI8SlotScaleBytes;
-    std::uint8_t* slot = slots + plane * kColdI8SlotBytes;
+    std::uint8_t* slot = slots + plane * slot_bytes;
     if (threadIdx.x == 0) {
         *reinterpret_cast<std::uint32_t*>(slot) = kColdI8SlotMagic;
         *reinterpret_cast<std::uint16_t*>(slot + 4) = 1; // version
@@ -43,12 +44,13 @@ __global__ void cold_i8_slot_pack_kernel(const std::uint8_t* __restrict__ src_co
 
 __global__ void cold_i8_slot_restore_kernel(const std::uint8_t* __restrict__ slots,
                                             int kv_heads, std::int8_t* __restrict__ dst_codes,
-                                            __half* __restrict__ dst_scales) {
+                                            __half* __restrict__ dst_scales,
+                                            int slot_bytes) {
     const int head = static_cast<int>(blockIdx.x);
     const int page = static_cast<int>(blockIdx.y);
     const std::int64_t plane = static_cast<std::int64_t>(head) +
                                static_cast<std::int64_t>(kv_heads) * page;
-    const std::uint8_t* slot = slots + plane * kColdI8SlotBytes;
+    const std::uint8_t* slot = slots + plane * slot_bytes;
     std::int8_t* codes = dst_codes + plane * (64 * 256);
     __half* scales     = dst_scales + plane * (64 * 4);
     const int row0     = static_cast<int>(threadIdx.x) >> 2;  // 64 rows
@@ -66,19 +68,19 @@ __global__ void cold_i8_slot_restore_kernel(const std::uint8_t* __restrict__ slo
 
 void cold_i8_slot_pack_launch(const std::uint8_t* src_codes, const std::uint8_t* src_scales,
                               int kv_heads, int page_count, std::uint8_t* slots,
-                              std::int32_t* slot_valid, cudaStream_t stream) {
+                              std::int32_t* slot_valid, int slot_bytes, cudaStream_t stream) {
     const dim3 grid(kv_heads, page_count);
     cold_i8_slot_pack_kernel<<<grid, 256, 0, stream>>>(src_codes, src_scales, kv_heads, slots,
-                                                       slot_valid);
+                                                       slot_valid, slot_bytes);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void cold_i8_slot_restore_launch(const std::uint8_t* slots, int kv_heads, int page_count,
                                  std::int8_t* dst_codes, void* dst_scales_fp16,
-                                 cudaStream_t stream) {
+                                 int slot_bytes, cudaStream_t stream) {
     const dim3 grid(kv_heads, page_count);
     cold_i8_slot_restore_kernel<<<grid, 256, 0, stream>>>(
-        slots, kv_heads, dst_codes, static_cast<__half*>(dst_scales_fp16));
+        slots, kv_heads, dst_codes, static_cast<__half*>(dst_scales_fp16), slot_bytes);
     CUDA_CHECK(cudaGetLastError());
 }
 

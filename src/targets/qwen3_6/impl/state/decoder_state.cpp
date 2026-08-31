@@ -1,5 +1,6 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "ninfer/ops/cold_i8.h"
+#include "ninfer/ops/entropy_nvfp4_slot.h"
 
 #include <limits>
 #include <span>
@@ -133,9 +134,13 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    {}, spec.kv_table_rows, spec.mtp_physical_page_groups);
     }
-    // Entropy-coded cold pool: fixed raw slots (9232 B) plus an I32 validity
-    // plane, per full-attention layer. Only active when the spec opts in.
-    const std::int32_t slot_bytes = ops::kColdI8SlotBytes;
+    // Cold pool slots: one fixed-size slot per (page, kv_head, plane). The
+    // INT8 tier packs requantized E2M1 nibbles into 9232 B raw slots; the
+    // NVFP4 tier rANS-encodes the same geometry into slots with a 320 B
+    // header, 32 x 256 B stream budget, and a 1024 B scale tail. One buffer
+    // size serves both: 9536 B covers the rANS max; the raw I8 layout keeps
+    // its offsets from slot start and simply leaves the tail unused.
+    const std::int32_t slot_bytes = ops::kEntropyNvfp4SlotBytes;
     if (spec.max_cold_pages != 0) {
         const std::uint32_t cold_pages = spec.max_cold_pages;
         layout.text_kv.slot_bytes = slot_bytes;

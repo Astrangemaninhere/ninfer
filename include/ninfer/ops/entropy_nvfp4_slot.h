@@ -8,6 +8,11 @@
 
 namespace ninfer::ops {
 
+// Fixed slot budget covering the rANS max: 320 B header + 32 streams x 256 B
+// + 1024 B scale tail. The INT8 tier packs its raw 9232 B layout into the
+// same buffer, so one pool size serves both codecs.
+inline constexpr std::int32_t kEntropyNvfp4SlotBytes = 9536;
+
 /**
  * Page-slot NVFP4 E2M1 rANS codec. One slot stores the 8192 packed code bytes
  * of one (physical page, kv_head, K|V plane). Each slot contains two 32-token
@@ -72,6 +77,14 @@ void entropy_nvfp4_slot_decode_half_raw(const std::uint8_t* slots, int slot_byte
 void entropy_nvfp4_slot_decode_grid_raw(const std::uint8_t* slots, int slot_bytes,
                                         std::int32_t slot_base, int kv_heads,
                                         std::uint8_t* dst, cudaStream_t stream);
+
+// Decodes one slot base and scatters the packed rows into the native
+// NVFP4 page-major code plane (row-major [64 x 128 B] per kv_head).
+// dec_scratch must hold kv_heads * 8192 bytes.
+void entropy_nvfp4_slot_restore_plane_raw(const std::uint8_t* slots, int slot_bytes,
+                                          std::int32_t slot_base, int kv_heads,
+                                          std::uint8_t* dec_scratch,
+                                          std::uint8_t* dst_codes, cudaStream_t stream);
 
 // Scatters the uncompressed 1024-byte scale tail of every (page, kv_head)
 // slot into the matching paged scale plane. slots uses the host-cold layout:
