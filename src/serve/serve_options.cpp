@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/kv_options.h"
 #include "product/speculative_options.h"
 
 #include <cerrno>
@@ -76,7 +77,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--spec mtp|dflash --draft-tokens N] "
            "[--cold-policy none|window|host] [--cold-keep-tokens N] "
            "[--cold-host-bytes N[g|m|k]] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
@@ -260,6 +261,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--kv-layer-storage") {
+            const auto table = product::parse_kv_layer_storage(require_value("--kv-layer-storage"));
+            for (std::size_t i = 0; i < options.kv_layer_storage.size(); ++i) {
+                options.kv_layer_storage[i] = table[i];
+            }
+            options.kv_layer_storage_explicit = true;
         } else if (arg == "--cold-policy") {
             const std::string_view v = require_value("--cold-policy");
             if (v == "none" || v == "off") { options.cold_policy = ColdPolicy::None; }

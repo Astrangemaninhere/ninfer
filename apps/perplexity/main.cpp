@@ -2,6 +2,7 @@
 #include "evaluation.h"
 
 #include "ninfer/engine.h"
+#include "product/kv_options.h"
 
 #include <nlohmann/json.hpp>
 
@@ -44,6 +45,8 @@ struct Options {
     std::uint32_t stride      = 2048;
     int device                = 0;
     ninfer::KvCacheStorage kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    std::array<ninfer::KvCacheStorage, ninfer::kKvLayerStorageSlots> kv_layer_storage{};
+    bool kv_layer_storage_explicit = false;
     bool quick                = false;
 };
 
@@ -52,7 +55,7 @@ struct Options {
                                 "\nusage: ninfer-perplexity <model.ninfer> "
                                 "(--corpus <manifest.json> [--quick] | --text <utf8-file>) "
                                 "[--context N] [--stride N] [--device N] "
-                                "[--kv-dtype bf16|int8|fp8] [--output <directory>]");
+                                "[--kv-dtype bf16|int8|fp8] [--kv-layer-storage SPEC] [--output <directory>]");
 }
 
 template <class Integer>
@@ -104,9 +107,15 @@ Options parse_options(int argc, char** argv) {
                 out.kv = ninfer::KvCacheStorage::Int8Group64;
             } else if (dtype == "fp8") {
                 out.kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
+            } else if (dtype == "nvfp4") {
+                out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
             } else {
-                usage_error("--kv-dtype must be bf16, int8, or fp8");
+                usage_error("--kv-dtype must be bf16, int8, fp8, or nvfp4");
             }
+        } else if (option == "--kv-layer-storage") {
+            const auto table = ninfer::product::parse_kv_layer_storage(value("--kv-layer-storage"));
+            out.kv_layer_storage = table;
+            out.kv_layer_storage_explicit = true;
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
         } else {
@@ -201,6 +210,8 @@ int run(const Options& options) {
     engine_options.device                 = options.device;
     engine_options.max_context            = options.context;
     engine_options.kv_cache               = options.kv;
+    engine_options.kv_layer_storage      = options.kv_layer_storage;
+    engine_options.kv_layer_storage_explicit = options.kv_layer_storage_explicit;
     engine_options.load_progress.callback = [&](std::string_view phase, std::uint64_t done,
                                                 std::uint64_t total) {
         const std::uint64_t bucket =
