@@ -22,11 +22,12 @@ namespace ninfer::targets::qwen3_6_27b::detail {
 
 std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
     // Data-driven prior from the offline calibration history: layer 14 is an
-    // extreme outlier (uniform-precision K NMSE ~30x the next layer), and the
-    // next five layers dominate the remaining error. Upgrading those six to
-    // INT8 keeps the long-generation error budget bounded at a modest byte
-    // cost. The rest of the table is BF16 = inherit the global --kv-dtype.
+    // extreme outlier (NVFP4 K NMSE ~30x the next layer), and the next five
+    // layers dominate the remaining error. Upgrading those to INT8 keeps the
+    // long-generation error budget bounded; the rest of the table is NVFP4
+    // (E2M1 K with E4M3 g16 scales, ISO3 V) in the production GQA tier.
     std::array<DType, 16> table{};
+    table.fill(DType::NVFP4);
     for (const int layer : {2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}) {
         table[static_cast<std::size_t>(layer)] = DType::I8;
     }
