@@ -292,7 +292,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
-    const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
+    const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -311,15 +311,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                      std::int32_t last, qwen3_6::TextPhase phase,
                                      std::int32_t batch_size, std::int32_t min_width,
                                      std::int32_t max_width,
-                                     ops::CausalAttentionExecutionEnvelope envelope) {
+                                     ops::GqaExecutionEnvelope envelope) {
         auto stage = layout.scope();
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
-        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_dtype, envelope, batch_size, min_width, max_width));
+        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+                            TextConfig::query_heads, plan.kv_dtype, envelope, batch_size,
+                            min_width, max_width));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };
@@ -363,7 +363,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
-                                 ops::CausalAttentionExecutionEnvelope envelope) {
+                                 ops::GqaExecutionEnvelope envelope) {
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
         gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);
@@ -378,20 +378,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::mtp_stem<TextConfig>(layout, tokens, !preembedded);
     };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
-                                   ops::CausalAttentionExecutionEnvelope envelope) {
+                                   ops::GqaExecutionEnvelope envelope) {
         auto core = layout.scope();
         mtp_stem(layout, tokens, false);
         (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
-        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_dtype, envelope, 1, tokens, tokens));
+        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+                            TextConfig::query_heads, plan.kv_dtype, envelope, 1, tokens, tokens));
         (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
     };
     const auto mtp_full_call = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
-                                   ops::CausalAttentionExecutionEnvelope envelope,
+                                   ops::GqaExecutionEnvelope envelope,
                                    bool build_proposal) {
         auto call = layout.scope();
         matrix(layout, DType::I32, 1, tokens);
@@ -420,9 +419,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         matrix(layout, DType::I32, 3, 1);
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
-        scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
-                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_dtype, text_envelope, 1, 1, 1));
+        scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
+                            TextConfig::query_heads, plan.kv_dtype, text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         matrix(layout, DType::BF16, TextConfig::hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
@@ -504,9 +502,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
                 (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
                 scratch(layout,
-                        ops::causal_softmax_attention_workspace_capacity_bytes(
-                            {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_dtype, text_envelope, batch, width, width));
+                        ops::gqa_attention_workspace_capacity_bytes(
+                            TextConfig::query_heads, plan.kv_dtype, text_envelope, batch, width, width));
                 (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
             };

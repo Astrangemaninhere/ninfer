@@ -10696,7 +10696,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
+                const ops::GqaExecutionEnvelope envelope{planned.min + 1,
                                                                      planned.max + 1};
                 schedule::capture_ordinary_decode_batch(ordinary_state,
                                                         static_cast<std::int32_t>(batch_size),
@@ -10754,7 +10754,7 @@ void ProgramImplCore::prepare_graphs() {
                                                   *dflash_host_egress,
                                                   state_images->continuation_hidden_store()};
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
-        const ops::CausalAttentionExecutionEnvelope code_warm_target{
+        const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
         prepare_representative(code_warm.min, 1);
@@ -10778,7 +10778,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope target_envelope{
+                const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
                         capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
@@ -10801,7 +10801,7 @@ void ProgramImplCore::prepare_graphs() {
                                                     *dflash2_host_egress,
                                                     state_images->continuation_hidden_store()};
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
-        const ops::CausalAttentionExecutionEnvelope code_warm_target{
+        const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
         prepare_representative(code_warm.min, 1);
@@ -10825,7 +10825,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope target_envelope{
+                const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
                         capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
@@ -10954,7 +10954,7 @@ void ProgramImplCore::extend_ordinary_graphs(std::uint32_t batch_size,
         profile.min_execution_frontier = planned.min;
         profile.max_execution_frontier = planned.max;
         profile.topology_class         = planned.topology_class * max_concurrency + (batch_size - 1U);
-        const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+        const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
         schedule::capture_ordinary_decode_batch(ordinary_state,
                                                 static_cast<std::int32_t>(batch_size), envelope,
                                                 profile.definition);
@@ -11428,7 +11428,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
-        ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+        ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
             // On-demand capture: with a startup ceiling, growth past the
             // captured segments extends the family once per crossing here.
@@ -11769,7 +11769,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
-        ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
@@ -11989,7 +11989,7 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlash2Envelopes envelopes = dflash2_envelopes(0, maximum_frontier, draft_window);
-        ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash2_graphs, static_cast<std::uint32_t>(lanes.size()),
