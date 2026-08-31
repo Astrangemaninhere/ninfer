@@ -201,7 +201,11 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN;
+    // The scaled/stride decision follows the layer's resolved dtype so a
+    // per-layer table (PR1) can mix quantized and BF16 layers in one pool.
+    const DType layer_dtype =
+        layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer];
+    const bool scaled        = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN;
     const std::size_t stride = scaled ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVLayerView{
@@ -228,7 +232,11 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
 
 PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool scaled        = dtype_ == DType::I8 || dtype_ == DType::FP8_E4M3FN;
+    // The scaled/stride decision follows the layer's resolved dtype so a
+    // per-layer table (PR1) can mix quantized and BF16 layers in one pool.
+    const DType layer_dtype =
+        layer_dtypes_.empty() ? dtype_ : layer_dtypes_[layer];
+    const bool scaled        = layer_dtype == DType::I8 || layer_dtype == DType::FP8_E4M3FN;
     const std::size_t stride = scaled ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVBatchLayerView{
