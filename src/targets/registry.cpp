@@ -93,6 +93,12 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                                        std::string_view target_key) {
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
+    // Resolve --spec auto up front so the planner, the load plan and the
+    // program all see the same concrete backend (previously only plan_load
+    // resolved it, so the planner built an Auto plan and the frozen startup
+    // features mismatch check rejected the loaded weights).
+    const EngineOptions resolved_options =
+        Target::resolved_auto_speculative(options, weights_profile);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
     const runtime::ContextCostIdentity context_cost_identity{
         .hardware_class = runtime::context_cost_hardware_class(
@@ -104,14 +110,14 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         context_cost_identity, options.context_cost.preset_path);
 
     artifact::Binder binder(reader);
-    auto load_plan        = Target::plan_load(binder, options, weights_profile);
-    auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
+    auto load_plan        = Target::plan_load(binder, resolved_options, weights_profile);
+    auto sequence_planner = Target::make_sequence_planner(device, resolved_options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes =
         runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
-    (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
+    (void)runtime::resolve_kv_capacity(resolved_options.kv_capacity, curve, preflight_runtime_bytes);
 
-    auto progress     = artifact_progress(options.load_progress);
+    auto progress     = artifact_progress(resolved_options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
                                               progress.callback ? &progress : nullptr);
     const artifact::MaterializationStats stats = materialized.stats();
@@ -119,13 +125,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
     runtime::KvCapacityResolution capacity_resolution =
-        runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
+        runtime::resolve_kv_capacity(resolved_options.kv_capacity, curve, current_free_device_bytes());
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
-    auto loaded   = std::make_unique<Loaded>(std::move(model), options);
+    auto loaded   = std::make_unique<Loaded>(std::move(model), resolved_options);
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
     device.synchronize();
