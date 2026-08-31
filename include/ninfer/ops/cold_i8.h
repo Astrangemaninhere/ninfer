@@ -19,12 +19,12 @@ inline constexpr std::int32_t kColdI8SlotBytes = 9232;
 // envelope) at 1.83x per head-page vs the raw int8 plane (16896 B).
 void cold_i8_slot_pack_raw(const std::uint8_t* src_codes, const std::uint8_t* src_scales,
                            int kv_heads, int page_count, std::uint8_t* slots,
-                           std::int32_t* slot_valid, cudaStream_t stream);
+                           std::int32_t* slot_valid, int slot_bytes, cudaStream_t stream);
 
 // Inverse: unpack slots into the INT8 tier's native planes (int8 codes +
 // fp16 group-64 scales). Used by the warm-restore path.
 void cold_i8_slot_restore_raw(const std::uint8_t* slots, int kv_heads, int page_count,
                               std::int8_t* dst_codes, void* dst_scales_fp16,
-                              cudaStream_t stream);
+                              int slot_bytes, cudaStream_t stream);
 
 } // namespace ninfer::ops

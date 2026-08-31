@@ -77,6 +77,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/gelu.cu
   ops/launcher/cold_i8.cu
   ops/launcher/entropy_cold_requant.cu
+  ops/launcher/entropy_nvfp4_slot.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
@@ -257,6 +258,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/embedding.cpp
   ops/wrapper/cold_i8.cpp
   ops/wrapper/entropy_cold_requant.cpp
+  ops/wrapper/entropy_nvfp4_slot.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp
