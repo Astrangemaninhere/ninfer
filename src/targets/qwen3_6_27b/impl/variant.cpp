@@ -21,16 +21,14 @@
 namespace ninfer::targets::qwen3_6_27b::detail {
 
 std::array<DType, 16> Variant::default_layer_kv_dtypes(WeightsProfile) {
-    // Data-driven prior from the offline calibration history: layer 14 is an
-    // extreme outlier (NVFP4 K NMSE ~30x the next layer), and the next five
-    // layers dominate the remaining error. Upgrading those to INT8 keeps the
-    // long-generation error budget bounded; the rest of the table is NVFP4
-    // (E2M1 K with E4M3 g16 scales, ISO3 V) in the production GQA tier.
-    // Measured (13.3k-token zh corpus, perplexity): 12I8+4NVFP4 = 1.408,
-    // all-INT8 = 1.432, all-BF16 = 1.685, 6I8+10NVFP4 = 1.975.
+    // Measured per-layer NVFP4 sensitivity (13.3k zh + 11.9k en perplexity):
+    // shallow/mid layers 0,1,3,4,6,7,8,9 tolerate NVFP4 at parity-or-better
+    // vs all-INT8 (zh 1.335 vs 1.432, en 1.2025 vs 1.2034) while the dense
+    // upper layers 2,5,10-15 degrade sharply (10 NVFP4 layers -> 1.551).
+    // The 8/8 split halves the page pool with no measurable quality cost.
     std::array<DType, 16> table{};
     table.fill(DType::NVFP4);
-    for (const int layer : {2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}) {
+    for (const int layer : {2, 5, 10, 11, 12, 13, 14, 15}) {
         table[static_cast<std::size_t>(layer)] = DType::I8;
     }
     return table;
