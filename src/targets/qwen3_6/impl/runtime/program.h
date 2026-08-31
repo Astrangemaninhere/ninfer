@@ -713,6 +713,18 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
 
+    // Cold-pool maintenance (rev 2b): staging + per-step compress pass.
+    ColdPolicy cold_policy      = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    void* cold_requant_codes       = nullptr;
+    void* cold_requant_scales      = nullptr;
+    std::uint32_t cold_requant_heads = 0;
+    void enqueue_cold_compressions(SequenceState& sequence);
+    void warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page);
+    void restore_cold_page(SequenceState& sequence, std::uint32_t page, std::int32_t slot,
+                           const DeviceKVPageHandle& physical);
+
     // On-demand graph capture state (see DecodeGraphFamily comment).
     std::uint32_t graph_capture_ceiling = 0;
     void extend_ordinary_graphs(std::uint32_t batch_size, std::uint32_t frontier);
