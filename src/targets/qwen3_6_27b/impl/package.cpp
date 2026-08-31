@@ -102,9 +102,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
-namespace {
-EngineOptions resolved_auto_speculative(const EngineOptions& options,
-                                        detail::WeightsProfile weights_profile) {
+EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
+                                                    WeightsProfile weights_profile) {
     EngineOptions resolved = options;
     if (options.speculative.backend != SpeculativeBackend::Auto) { return resolved; }
     const DType kv_dtype =
@@ -129,11 +128,10 @@ EngineOptions resolved_auto_speculative(const EngineOptions& options,
     }
     return resolved;
 }
-} // namespace
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    const EngineOptions resolved = resolved_auto_speculative(options, weights_profile);
+    const EngineOptions resolved = Package::resolved_auto_speculative(options, weights_profile);
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(resolved))));

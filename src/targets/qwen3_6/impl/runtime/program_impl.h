@@ -10731,6 +10731,11 @@ void ProgramImplCore::prepare_graphs() {
                     dflash->pending_features.slice(2, static_cast<std::int32_t>(row), 1);
                 CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream));
             }
+            if (dflash2) {
+                const Tensor pending =
+                    dflash2->pending_features.slice(2, static_cast<std::int32_t>(row), 1);
+                CUDA_CHECK(cudaMemsetAsync(pending.data, 0, pending.bytes(), device.stream));
+            }
         }
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
@@ -10739,24 +10744,33 @@ void ProgramImplCore::prepare_graphs() {
                            checked_i32(frontier, "graph representative MTP position"));
         }
         if (io.dflash_decode) {
-            *dflash_host_ingress       = {};
-            *dflash_host_egress        = {};
+            // DFlash and DFlash2 share the decode frame but keep separate
+            // host ingress/egress buffers; only the active backend's is
+            // allocated (dflash_host_* vs dflash2_host_*).
+            qwen3_6::DFlashDecodeIngress* ingress =
+                speculative_backend == SpeculativeBackend::DFlash2 ? dflash2_host_ingress
+                                                                   : dflash_host_ingress;
+            qwen3_6::DFlashDecodeEgress* egress =
+                speculative_backend == SpeculativeBackend::DFlash2 ? dflash2_host_egress
+                                                                   : dflash_host_egress;
+            *ingress                 = {};
+            *egress                  = {};
             const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
             for (std::uint32_t row = 0; row < batch_size; ++row) {
-                dflash_host_ingress->anchors[row] = 0;
-                dflash_host_ingress->execution_frontiers[row] =
+                ingress->anchors[row] = 0;
+                ingress->execution_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash frontier");
-                dflash_host_ingress->context_frontiers[row] =
+                ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
-                dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
-                dflash_host_ingress->target_valid_columns[row] =
+                ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
+                ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
-                dflash_host_ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
-                dflash_host_ingress->dflash_kv_table_rows[row]    = static_cast<std::int32_t>(row);
-                dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(row);
-                dflash_host_ingress->state_source_slots[row]      = capture_state_slot(row);
-                dflash_host_ingress->state_destination_slots[row] = capture_state_slot(row);
-                dflash_host_ingress->sampling[row]                = {};
+                ingress->text_kv_table_rows[row]      = static_cast<std::int32_t>(row);
+                ingress->dflash_kv_table_rows[row]    = static_cast<std::int32_t>(row);
+                ingress->active_lanes[row]            = static_cast<std::int32_t>(row);
+                ingress->state_source_slots[row]      = capture_state_slot(row);
+                ingress->state_destination_slots[row] = capture_state_slot(row);
+                ingress->sampling[row]                = {};
             }
         }
         if (io.mtp_decode) {
@@ -10962,11 +10976,15 @@ void ProgramImplCore::prepare_graphs() {
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
+        std::fprintf(stderr, "[df2diag] prepare_representative min=%u\n", code_warm.min);
         prepare_representative(code_warm.min, 1);
+        std::fprintf(stderr, "[df2diag] after prepare_representative\n");
         device.synchronize();
+        std::fprintf(stderr, "[df2diag] calling dflash2_decode_batch\n");
         schedule::dflash2_decode_batch(dflash2_state, 1, draft_window,
                                        dflash2_envelopes(code_warm.min, code_warm.max, draft_window),
                                        code_warm_target, nullptr);
+        std::fprintf(stderr, "[df2diag] after dflash2_decode_batch\n");
         device.synchronize();
 
         dflash2_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
