@@ -78,8 +78,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         } else if (selected == DType::FP8_E4M3FN) {
             geometry.planes.push_back({DType::FP8_E4M3FN, head_dim, kv_heads, 256});
             geometry.planes.push_back({DType::FP8_E4M3FN, head_dim, kv_heads, 256});
-            geometry.planes.push_back({DType::FP8_E4M3FN, head_dim / group, kv_heads, 256});
-            geometry.planes.push_back({DType::FP8_E4M3FN, head_dim / group, kv_heads, 256});
+            // FP8 per-group scales are FP16 in the production codecs; the
+            // attention kernels require FP16 scale planes.
+            geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
+            geometry.planes.push_back({DType::FP16, head_dim / group, kv_heads, 256});
         } else {
             // NVFP4 tier: K keeps E2M1 packed codes with per-16 E4M3FN scales;
             // V stores ISO3 sign-magnitude nibbles in the same plane geometry
