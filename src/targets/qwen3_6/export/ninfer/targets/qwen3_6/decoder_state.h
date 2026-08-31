@@ -49,6 +49,10 @@ struct PagedKVCacheLayout {
     std::uint32_t max_cold_pages = 0;
     // Resolved per-layer storage (one entry per full-attention layer).
     std::array<DType, 16> layer_dtypes{};
+    // Plane offset of each layer in the page geometry (prefix sums over
+    // per-layer plane counts; mixed BF16/quantized tables have unequal
+    // strides).
+    std::array<std::uint32_t, 16> layer_plane_base{};
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -128,6 +132,7 @@ private:
     std::uint32_t max_cold_pages_ = 0;
     std::vector<std::uint8_t> cold_slot_used_;
     std::array<DType, 16> layer_dtypes_{};
+    std::array<std::uint32_t, 16> layer_plane_base_{};
     std::int32_t quant_group_  = 0;
 };
 
