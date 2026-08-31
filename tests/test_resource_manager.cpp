@@ -950,8 +950,9 @@ public:
 
     void invalidate_resources() noexcept { advance_revision(); }
 
-    std::size_t required_pressure_actions           = 0;
-    std::uint32_t private_pressure_alternatives     = 1;
+    std::size_t required_pressure_actions       = 0;
+    std::uint32_t private_pressure_alternatives = 1;
+    std::optional<std::size_t> pressure_optional_target_capacity;
     std::uint64_t pressure_action_immediate_ns      = 100'000'000;
     std::uint32_t pressure_action_degradation_units = 1;
     bool include_cumulative_private_target          = false;
@@ -976,6 +977,7 @@ public:
     std::uint64_t finish_calls                  = 0;
     std::uint64_t abort_calls                   = 0;
     std::uint64_t skipped_captures              = 0;
+    std::size_t pressure_target_count_peak      = 0;
     std::uint32_t finish_frontier               = 16;
     std::uint32_t started_source_id             = 0;
     ClaimDisposition started_source_disposition = ClaimDisposition::ConsumedToActive;
@@ -1037,6 +1039,8 @@ FakePressurePlanningSession::FakePressurePlanningSession(
             .stable_ordinal  = static_cast<std::uint32_t>(index),
         });
     }
+    program.pressure_target_count_peak =
+        std::max(program.pressure_target_count_peak, targets_.size());
     if (++program.planning_generation_ == 0) { ++program.planning_generation_; }
     ++program.pressure_planning_sessions;
     generation_ = program.planning_generation_;
@@ -1295,6 +1299,13 @@ FakePressurePlanningSession::commit_expansion(FakePreparedPressureExpansion&& pr
     require(scratch_live_ && prepared.generation == generation_ &&
                 prepared.scratch_generation == scratch_generation_,
             "fake prepared expansion is stale");
+    if (program_->pressure_optional_target_capacity) {
+        const std::size_t maximum =
+            candidates_.size() + 1U + *program_->pressure_optional_target_capacity;
+        if (prepared.new_count > maximum - std::min(maximum, targets_.size())) {
+            throw std::length_error("prepared pressure expansion exceeds the target arena");
+        }
+    }
     committed_children_.clear();
     std::uint32_t new_count = 0;
     for (Target& child : expansion_scratch_) {
@@ -1312,6 +1323,8 @@ FakePressurePlanningSession::commit_expansion(FakePreparedPressureExpansion&& pr
         committed_children_.push_back(
             FakePressureTargetHandle{.generation = generation_, .index = index});
     }
+    program_->pressure_target_count_peak =
+        std::max(program_->pressure_target_count_peak, targets_.size());
     require(new_count == prepared.new_count, "fake expansion count changed before commit");
     expansion_scratch_.clear();
     scratch_live_ = false;
@@ -1572,6 +1585,55 @@ void test_shared_capture_subtracts_private_transition_loss() {
     require(result && result->baseline_value == 0 && result->target_value == 1000 &&
                 result->immediate_ns == 0 && result->net_gain == 600,
             "shared capture gain did not subtract the private capability transition loss");
+}
+
+void test_shared_capture_budget_bounds_committed_canonical_targets() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakePackage>;
+
+    constexpr std::size_t private_owner_count = 16;
+    constexpr std::size_t shared_owner_count  = 4;
+    constexpr std::uint32_t target_budget     = 64;
+
+    FakeProgram program;
+    program.required_pressure_actions         = private_owner_count + shared_owner_count + 1U;
+    program.pressure_optional_target_capacity = target_budget;
+
+    std::array<FakeContinuationHandle, private_owner_count> private_handles;
+    std::array<const FakeContinuationHandle*, private_owner_count> private_owners;
+    std::array<std::uint32_t, private_owner_count> private_ordinals;
+    for (std::size_t index = 0; index < private_owner_count; ++index) {
+        private_handles[index]  = FakeContinuationHandle(static_cast<std::uint32_t>(index + 1U), 0);
+        private_owners[index]   = &private_handles[index];
+        private_ordinals[index] = static_cast<std::uint32_t>(index);
+    }
+
+    std::array<FakeSharedPrefixHandle, shared_owner_count> shared_handles;
+    std::array<const FakeSharedPrefixHandle*, shared_owner_count> shared_owners;
+    std::array<std::uint32_t, shared_owner_count> shared_ordinals;
+    for (std::size_t index = 0; index < shared_owner_count; ++index) {
+        shared_handles[index].id = static_cast<std::uint32_t>(index + 1U);
+        shared_owners[index]     = &shared_handles[index];
+        shared_ordinals[index]   = static_cast<std::uint32_t>(private_owner_count + index);
+    }
+
+    const FakeCaptureAssessment capture{
+        .shortlist_key       = FakeShortlistKey{.digest = 91, .frontier = 64},
+        .publishes_shared    = true,
+        .physically_feasible = false,
+    };
+    Planner planner;
+    const auto result = planner.plan(program, test_cost_model(),
+                                     Planner::Input{
+                                         .capture                = &capture,
+                                         .private_owners         = private_owners,
+                                         .private_owner_ordinals = private_ordinals,
+                                         .shared_owners          = shared_owners,
+                                         .shared_owner_ordinals  = shared_ordinals,
+                                         .target_budget          = target_budget,
+                                     });
+    require(!result, "bounded infeasible shared-capture search unexpectedly found a plan");
+    require(program.pressure_target_count_peak <= target_budget,
+            "shared-capture search committed more canonical targets than its budget");
 }
 
 void test_equal_lower_bound_does_not_short_circuit_tie_break() {
@@ -2365,6 +2427,8 @@ int main() {
     run_test("portfolio demand and owner aggregation", test_portfolio_demand_and_owner_aggregation);
     run_test("shared capture private transition loss",
              test_shared_capture_subtracts_private_transition_loss);
+    run_test("shared capture committed target budget",
+             test_shared_capture_budget_bounds_committed_canonical_targets);
     run_test("equal lower-bound tie-break",
              test_equal_lower_bound_does_not_short_circuit_tie_break);
     run_test("feasible identity pressure improvement",

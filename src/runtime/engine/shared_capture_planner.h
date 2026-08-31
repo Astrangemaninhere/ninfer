@@ -100,6 +100,10 @@ public:
         const PressureTargetHandle identity = session.identity_target(candidate);
         queue_.push_back(identity);
         std::optional<Incumbent> incumbent;
+        // The identity target is already canonical in the Program session.  The search budget
+        // bounds every canonical target admitted to this scenario, including children committed
+        // now but still waiting in the breadth-first queue; assessed targets are only telemetry.
+        std::uint32_t canonical_targets = 1;
         std::uint32_t targets_evaluated = 0;
         std::size_t cursor              = 0;
 
@@ -127,12 +131,13 @@ public:
 
             if (!assessment.expandable || contains(expanded_, target)) { continue; }
             auto prepared                 = session.prepare_expansion(target);
-            const std::uint32_t remaining = input.target_budget - targets_evaluated;
+            const std::uint32_t remaining = input.target_budget - canonical_targets;
             if (prepared.new_canonical_count() > remaining) {
                 session.discard_expansion(std::move(prepared));
                 continue;
             }
             const auto children = session.commit_expansion(std::move(prepared));
+            canonical_targets += children.new_canonical_count;
             expanded_.push_back(target);
             for (const PressureTargetHandle child : children.children) {
                 if (!contains(assessed_, child) && !contains(queue_, child)) {
