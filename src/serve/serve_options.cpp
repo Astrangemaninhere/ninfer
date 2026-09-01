@@ -279,6 +279,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--yarn") {
+            options.yarn_enabled = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
@@ -332,9 +334,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
+    // An explicit --kv-capacity may floor the device page pool below max_context:
+    // YaRN extends the rope domain beyond the pool, and the cold pool recycles
+    // committed pages under pressure so the context can keep growing.
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
-        options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        options.kv_capacity.explicit_tokens == 0) {
+        throw std::invalid_argument("--kv-capacity must be positive");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");

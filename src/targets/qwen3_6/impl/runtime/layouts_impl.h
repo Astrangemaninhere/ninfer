@@ -586,8 +586,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 }
 
 void validate_target_options(DeviceContext& device, const EngineOptions& options) {
-    if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
-        throw std::invalid_argument("max_context exceeds the variant native context capacity");
+    // Static YaRN factor-4 extends the rope domain to 4x the native context.
+    const std::uint32_t context_limit =
+        options.yarn_enabled ? 4ULL * Variant::maximum_context : Variant::maximum_context;
+    if (options.max_context == 0 || options.max_context > context_limit) {
+        throw std::invalid_argument(
+            options.yarn_enabled
+                ? "max_context exceeds the variant YaRN-extended context capacity"
+                : "max_context exceeds the variant native context capacity");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
@@ -596,7 +602,13 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
-    const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    // An explicit --kv-capacity may floor the device page pool below max_context
+    // (YaRN extends the rope domain beyond the pool; the cold pool recycles pages).
+    std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
+        minimum_pages = std::max(page_count(options.kv_capacity.explicit_tokens),
+                                 options.max_concurrency);
+    }
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
@@ -604,8 +616,8 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
-            throw std::invalid_argument("kv_capacity must be at least max_context");
+        if (options.kv_capacity.explicit_tokens == 0) {
+            throw std::invalid_argument("kv_capacity must be positive");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
         if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
@@ -736,6 +748,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
+        .kv_capacity_tokens  = options.kv_capacity.mode == KvCapacityMode::Explicit
+                                   ? std::optional<std::uint32_t>(options.kv_capacity.explicit_tokens)
+                                   : std::nullopt,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
@@ -750,7 +765,13 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .context_cache       = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    // The device page pool normally covers the full max_context; an explicit
+    // --kv-capacity below max_context instead floors the pool at that size so
+    // the rope domain (4x under YaRN) can exceed what the pool can hold.
+    std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    if (inputs.kv_capacity_tokens) {
+        minimum_pages = std::max(page_count(*inputs.kv_capacity_tokens), inputs.max_concurrency);
+    }
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {

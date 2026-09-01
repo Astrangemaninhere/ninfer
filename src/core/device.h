@@ -15,6 +15,8 @@ struct DeviceContext {
     cudaStream_t stream          = nullptr;
     cudaStream_t transfer_stream = nullptr;
     cudaDeviceProp props{};
+    // Static YaRN factor-4 rope extension (Text D256/R64 and DFlash D128/R128).
+    bool yarn_enabled = false;
 
     explicit DeviceContext(int device_id = 0);
     ~DeviceContext();

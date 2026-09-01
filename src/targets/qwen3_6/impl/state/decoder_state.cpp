@@ -32,8 +32,11 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     }
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
-        throw std::invalid_argument("Paged KV physical pages are below logical capacity");
+    // An explicit --kv-capacity may floor the device page pool below max_context:
+    // the rope domain (4x under YaRN) can exceed the pool, and the cold pool
+    // recycles committed pages under pressure so the context keeps growing.
+    if (physical_page_groups == 0) {
+        throw std::invalid_argument("Paged KV physical page capacity is zero");
     }
 
     KVPageGeometry geometry;

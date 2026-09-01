@@ -27,6 +27,7 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    bool yarn_enabled     = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;

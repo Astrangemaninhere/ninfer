@@ -154,6 +154,8 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--yarn") {
+            options.yarn_enabled = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -207,8 +209,8 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
-        options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        options.kv_capacity.explicit_tokens == 0) {
+        throw std::invalid_argument("--kv-capacity must be positive");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
