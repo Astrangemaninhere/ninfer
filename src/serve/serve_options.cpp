@@ -272,7 +272,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (v == "none" || v == "off") { options.cold_policy = ColdPolicy::None; }
             else if (v == "window") { options.cold_policy = ColdPolicy::Window; }
             else if (v == "host") { options.cold_policy = ColdPolicy::Host; }
+            else if (v == "disk") { options.cold_policy = ColdPolicy::Disk; }
             else { throw std::invalid_argument("invalid cold-policy: " + std::string(v)); }
+        } else if (arg == "--cold-disk-path") {
+            options.cold_disk_path = require_value("--cold-disk-path");
+        } else if (arg == "--cold-disk-bytes") {
+            options.cold_disk_bytes =
+                parse_u64(require_value("--cold-disk-bytes"), "cold-disk-bytes");
+            if (options.cold_disk_bytes == 0) {
+                throw std::invalid_argument("--cold-disk-bytes must be positive");
+            }
         } else if (arg == "--cold-keep-tokens") {
             options.cold_keep_tokens =
                 parse_u64(require_value("--cold-keep-tokens"), "cold-keep-tokens");

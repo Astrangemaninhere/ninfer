@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -754,6 +755,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
+      cold_policy(plan.cold_policy), cold_keep_tokens(plan.cold_keep_tokens),
+      cold_host_bytes(plan.cold_host_bytes), cold_disk_path(plan.cold_disk_path),
+      cold_disk_bytes(plan.cold_disk_bytes),
       graph_capture_ceiling(plan.graph_capture_ceiling),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -844,7 +848,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     };
 
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
-    if (cold_policy == ColdPolicy::Window) {
+    if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk) {
         const std::int32_t requant_heads = decoder->text_kv.batch_layer_view(0).num_kv_heads;
         if (requant_heads > 0) {
             CUDA_CHECK(cudaMalloc(&cold_requant_codes,
@@ -852,6 +856,33 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             CUDA_CHECK(cudaMalloc(&cold_requant_scales,
                                   1024ULL * static_cast<std::uint64_t>(requant_heads)));
             cold_requant_heads = static_cast<std::uint32_t>(requant_heads);
+        }
+    }
+    if (cold_policy == ColdPolicy::Disk) {
+        // Per-layer spill files: each slot is a fixed stride of compressed
+        // bytes, so the file offset is slot * stride. Opened once; the engine
+        // truncates on start (cold pages are re-spilled as they age).
+        const std::uint32_t layers = decoder->text_kv.layers();
+        const std::string dir =
+            cold_disk_path.empty() ? std::string("/tmp") : cold_disk_path;
+        cold_disk_files.assign(layers, nullptr);
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+            if (view.cold_slots.data == nullptr) { continue; }
+            const std::string path = dir + "/ninfer_cold_L" + std::to_string(layer) + ".slot";
+            FILE* f                = std::fopen(path.c_str(), "w+b");
+            if (f == nullptr) {
+                throw std::runtime_error("cold disk open failed: " + path);
+            }
+            cold_disk_files[layer] = f;
+            cold_disk_slot_bytes   = std::max(cold_disk_slot_bytes,
+                                              static_cast<std::size_t>(view.cold_slots.nb[3]));
+        }
+        if (cold_disk_slot_bytes != 0) {
+            CUDA_CHECK(cudaHostAlloc(&cold_disk_staging[0], cold_disk_slot_bytes,
+                                     cudaHostAllocDefault));
+            CUDA_CHECK(cudaHostAlloc(&cold_disk_staging[1], cold_disk_slot_bytes,
+                                     cudaHostAllocDefault));
         }
     }
     text_host_kv_page_stride =
@@ -1050,6 +1081,17 @@ ProgramImplCore::~ProgramImplCore() noexcept {
         cold_requant_codes  = nullptr;
         cold_requant_scales = nullptr;
     }
+    for (FILE* f : cold_disk_files) {
+        if (f != nullptr) { std::fclose(f); }
+    }
+    cold_disk_files.clear();
+    for (void* p : cold_disk_staging) {
+        if (p != nullptr) {
+            (void)cudaFreeHost(p);
+        }
+    }
+    cold_disk_staging[0] = nullptr;
+    cold_disk_staging[1] = nullptr;
 }
 
 std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
@@ -9255,7 +9297,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     SharedPrefixSlotRole::Catalogued;
             // A retained source may carry cold-pool pages: warm them back into
             // physical pages before any prefix fork touches the membership.
-            if (private_source_ready && cold_policy == ColdPolicy::Window) {
+            if (private_source_ready &&
+                (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk)) {
                 SequenceState& source = continuation_states[transaction.source_index];
                 if (source.kv && source.kv->text.valid() &&
                     text_kv_addresses->active(source.kv->text)) {
@@ -10378,7 +10421,8 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
 // decode kernels read cold pages straight from the slots, so no restore is
 // needed on the steady-state path.
 void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
-    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
+    if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Disk) ||
+        !sequence.kv || decoder == nullptr ||
         !sequence.kv->text.valid() || cold_requant_codes == nullptr) {
         return;
     }
@@ -10482,6 +10526,37 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
         }
         device.synchronize();
 
+        if (cold_policy == ColdPolicy::Disk && cold_disk_staging != nullptr) {
+            // Mirror every layer's slot bytes into its spill file. The slot
+            // is a fixed-stride unit; file offset = slot * stride.
+            bool mirrored = true;
+            for (std::uint32_t layer = 0; layer < layers; ++layer) {
+                FILE* f = layer < cold_disk_files.size() ? cold_disk_files[layer] : nullptr;
+                if (f == nullptr) { continue; }
+                const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+                const Tensor cold_slots          = view.cold_slots;
+                if (cold_slots.data == nullptr) { continue; }
+                auto* k_slot = static_cast<const std::uint8_t*>(cold_slots.data) +
+                               static_cast<std::int64_t>(slot) * cold_slots.nb[3];
+                const std::size_t bytes = static_cast<std::size_t>(cold_slots.nb[3]);
+                CUDA_CHECK(cudaMemcpyAsync(cold_disk_staging[0], k_slot, bytes,
+                                           cudaMemcpyDeviceToHost, device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                const std::int64_t offset = static_cast<std::int64_t>(slot) *
+                                            static_cast<std::int64_t>(bytes);
+                if (std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0 ||
+                    std::fwrite(cold_disk_staging[0], 1, bytes, f) != bytes) {
+                    mirrored = false;
+                    break;
+                }
+            }
+            if (!mirrored) {
+                decoder->text_kv.release_cold_slot(slot);
+                continue;
+            }
+            std::fflush(nullptr);
+        }
+
         // A slot only counts once every head's pack kernel committed its valid
         // flag; otherwise the page would decode as garbage through the slot.
         // Valid tensor is [kv_heads, 2, pages] col-major: head innermost,
@@ -10526,10 +10601,39 @@ void ProgramImplCore::enqueue_cold_compressions(SequenceState& sequence) {
 // release the slot. Shared by the rewrite warm path and the checkpoint
 // restore path (which must repopulate cold pages without a host replica).
 void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t page,
-                                        std::int32_t slot, const DeviceKVPageHandle& physical) {
+                                        std::int32_t slot, const DeviceKVPageHandle& physical,
+                                        bool disk_prefetched) {
     const int kv_heads          = decoder->text_kv.batch_layer_view(0).num_kv_heads;
     const std::uint32_t layers  = decoder->text_kv.layers();
     const std::int32_t ph_index = physical.index();
+    // Disk tier: `slot` is a file slot, not a device slot. Bind a temporary
+    // device staging slot, read the file back into it, and decode from it;
+    // the staging slot is released after the decode kernels.
+    std::int32_t staging_slot = slot;
+    if (cold_policy == ColdPolicy::Disk && cold_disk_staging[0] != nullptr) {
+        staging_slot = decoder->text_kv.allocate_cold_slot();
+        if (staging_slot < 0) { return; }  // no staging slot: leave the page cold
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            FILE* f = layer < cold_disk_files.size() ? cold_disk_files[layer] : nullptr;
+            if (f == nullptr) { continue; }
+            const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+            const Tensor cold_slots          = view.cold_slots;
+            if (cold_slots.data == nullptr) { continue; }
+            const std::size_t bytes = static_cast<std::size_t>(cold_slots.nb[3]);
+            const std::int64_t offset =
+                static_cast<std::int64_t>(slot) * static_cast<std::int64_t>(bytes);
+            if (std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0 ||
+                std::fread(cold_disk_staging[0], 1, bytes, f) != bytes) {
+                continue;
+            }
+            auto* k_slot = static_cast<std::uint8_t*>(cold_slots.data) +
+                           static_cast<std::int64_t>(staging_slot) * cold_slots.nb[3];
+            CUDA_CHECK(cudaMemcpyAsync(k_slot, cold_disk_staging[0], bytes,
+                                       cudaMemcpyHostToDevice, device.stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    }
+    slot = staging_slot;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
         const Tensor cold_slots          = view.cold_slots;
@@ -10582,6 +10686,9 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
         }
     }
     decoder->text_kv.release_cold_slot(slot);
+    if (cold_policy == ColdPolicy::Disk && staging_slot != slot) {
+        decoder->text_kv.release_cold_slot(staging_slot);
+    }
     auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
                               [page](const SequenceState::ColdPageEntry& e) {
                                   return e.page == page;
@@ -10593,8 +10700,36 @@ void ProgramImplCore::restore_cold_page(SequenceState& sequence, std::uint32_t p
 // Warm-restore the cold prefix of a sequence (rewrite/resume paths only): the
 // steady-state decode path reads cold pages directly from their slots, but a
 // rewrite needs real physical pages so append/fork can mutate them again.
+void ProgramImplCore::prefetch_cold_pages(SequenceState& sequence, std::uint32_t pages,
+                                          std::span<const std::int32_t> slots) {
+    if (cold_policy != ColdPolicy::Disk || cold_disk_staging[0] == nullptr) { return; }
+    // Pre-read the file regions into pinned staging to warm the OS page
+    // cache; the actual H2D happens in restore once a device staging slot is
+    // allocated, so the read latency is hidden behind the previous decode.
+    const std::uint32_t layers = decoder->text_kv.layers();
+    for (std::uint32_t i = 0; i < pages; ++i) {
+        const std::int32_t slot = slots[i];
+        if (slot < 0) { continue; }
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            FILE* f = layer < cold_disk_files.size() ? cold_disk_files[layer] : nullptr;
+            if (f == nullptr) { continue; }
+            const PagedKVBatchLayerView view = decoder->text_kv.batch_layer_view(layer);
+            const Tensor cold_slots          = view.cold_slots;
+            if (cold_slots.data == nullptr) { continue; }
+            const std::size_t bytes = static_cast<std::size_t>(cold_slots.nb[3]);
+            const std::int64_t offset =
+                static_cast<std::int64_t>(slot) * static_cast<std::int64_t>(bytes);
+            if (std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0 ||
+                std::fread(cold_disk_staging[0], 1, bytes, f) != bytes) {
+                continue;
+            }
+        }
+    }
+}
+
 void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page) {
-    if (cold_policy != ColdPolicy::Window || !sequence.kv || decoder == nullptr ||
+    if ((cold_policy != ColdPolicy::Window && cold_policy != ColdPolicy::Disk) ||
+        !sequence.kv || decoder == nullptr ||
         cold_requant_codes == nullptr || sequence.cold_pages.empty()) {
         return;
     }
@@ -10603,6 +10738,25 @@ void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t en
     const std::uint32_t mapped = store.mapped_pages(text);
     const std::uint32_t pages  = std::min(end_page, mapped);
     if (pages == 0) { return; }
+
+    // Disk tier: prefetch every pending cold slot (file -> staging -> device
+    // slot, async on the transfer stream) before the decode kernels run, so
+    // the H2D legs overlap with the previous decode step.
+    std::vector<std::int32_t> prefetch_slots;
+    if (cold_policy == ColdPolicy::Disk) {
+        prefetch_slots.reserve(pages);
+        for (std::uint32_t page = 0; page < pages; ++page) {
+            if (!store.cold_compressed(text, page)) { continue; }
+            auto entry = std::find_if(sequence.cold_pages.begin(), sequence.cold_pages.end(),
+                                      [page](const SequenceState::ColdPageEntry& e) {
+                                          return e.page == page;
+                                      });
+            if (entry == sequence.cold_pages.end()) { continue; }
+            prefetch_slots.push_back(entry->slot);
+        }
+        prefetch_cold_pages(sequence, static_cast<std::uint32_t>(prefetch_slots.size()),
+                            prefetch_slots);
+    }
 
     std::uint32_t restored = 0;
     for (std::uint32_t page = 0; page < pages; ++page) {
@@ -10614,7 +10768,8 @@ void ProgramImplCore::warm_cold_prefix(SequenceState& sequence, std::uint32_t en
         if (entry == sequence.cold_pages.end()) { continue; }
         const DeviceKVPageHandle physical = store.restore_from_cold(text, page);
         const std::int32_t ph_index      = physical.index();
-        restore_cold_page(sequence, page, entry->slot, physical);
+        restore_cold_page(sequence, page, entry->slot, physical,
+                          cold_policy == ColdPolicy::Disk);
         decoder->text_kv.execution_tables().publish_indices(
             store.execution_row(text).handle(), page,
             std::span<const std::int32_t>(&ph_index, 1), device.stream);
@@ -12081,7 +12236,7 @@ ProgramImplCore::decode_raw(std::span<const std::uint32_t> lanes,
     // Cold-pool maintenance at the round boundary (window policy only).
     // Every active sequence maintains its own retired prefix; multi-lane
     // batches compress each lane's pages independently.
-    if (cold_policy == ColdPolicy::Window) {
+    if (cold_policy == ColdPolicy::Window || cold_policy == ColdPolicy::Disk) {
         for (const std::uint32_t lane : lanes) {
             SequenceState& sequence = active_sequence(lane);
             if (sequence.kv) {
@@ -12186,8 +12341,13 @@ ProgramImplCore::decode_dflash2_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
+            // Same length demotion as the budget loop above: lanes past the
+            // threshold draft nothing this round (dense single-token round).
+            const bool lane_beyond_demote = frontier > qwen3_6::kSpecDemoteTokens;
             const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                lane_beyond_demote
+                    ? 0U
+                    : std::min({draft_window, max_by_budget, capacity - frontier - 1U});
             dflash2_host_ingress->anchors[row] = sequence.ledger.back();
             dflash2_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash2 batch frontier");

@@ -720,10 +720,27 @@ public:
     void* cold_requant_codes       = nullptr;
     void* cold_requant_scales      = nullptr;
     std::uint32_t cold_requant_heads = 0;
+    // ColdPolicy::Disk: per-layer spill files (one fixed stride per slot) and
+    // a pinned staging buffer for the D2H/H2D legs. Files live for the
+    // process lifetime; the payload is the same compressed slot bytes.
+    // Double-buffered staging lets the warm path prefetch the next slot while
+    // the previous one decodes.
+    std::string cold_disk_path;
+    std::uint64_t cold_disk_bytes = 32ULL << 30;
+    std::vector<FILE*> cold_disk_files;
+    void* cold_disk_staging[2]    = {nullptr, nullptr};
+    std::size_t cold_disk_slot_bytes = 0;
+    // File-slot counter for ColdPolicy::Disk: each spilled page gets a
+    // monotonically increasing file offset (slot * stride); the device
+    // staging pool is reused across spills, so file slots are not device
+    // slots.
+    std::uint64_t cold_disk_file_slots = 0;
+    void prefetch_cold_pages(SequenceState& sequence, std::uint32_t pages,
+                             std::span<const std::int32_t> slots);
     void enqueue_cold_compressions(SequenceState& sequence);
     void warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page);
     void restore_cold_page(SequenceState& sequence, std::uint32_t page, std::int32_t slot,
-                           const DeviceKVPageHandle& physical);
+                           const DeviceKVPageHandle& physical, bool disk_prefetched = false);
 
     // On-demand graph capture state (see DecodeGraphFamily comment).
     std::uint32_t graph_capture_ceiling = 0;

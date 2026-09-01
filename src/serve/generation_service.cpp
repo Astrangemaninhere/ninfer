@@ -245,6 +245,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.cold_policy              = options_.cold_policy;
     engine_options.cold_keep_tokens         = options_.cold_keep_tokens;
     engine_options.cold_host_bytes          = options_.cold_host_bytes;
+    engine_options.cold_disk_path           = options_.cold_disk_path;
+    engine_options.cold_disk_bytes          = options_.cold_disk_bytes;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;

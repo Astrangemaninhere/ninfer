@@ -137,11 +137,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
                      .layer_kv_dtypes           = plan.layer_kv_dtypes,
+                     .layer_residual            = plan.kv_residual_layers,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency + 1),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
-                     .max_cold_pages            = plan.cold_policy == ColdPolicy::Window
+                     .max_cold_pages            = (plan.cold_policy == ColdPolicy::Window ||
+                                                    plan.cold_policy == ColdPolicy::Disk)
                                                           ? plan.cold_keep_tokens / kPagedKVPageSize + 16
                                                           : 0,
                  });
@@ -771,6 +773,15 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             throw std::invalid_argument("MTP draft window must be in [1,5]");
         }
         break;
+    case SpeculativeBackend::DFlash2:
+        // Explicit --spec dflash2 without --draft-tokens uses the fixed
+        // 7-draft block; normalize here so the planner never sees a zero
+        // draft window (empty graph profiles / zero-width layouts).
+        if (options.speculative.draft_tokens != 0 &&
+            options.speculative.draft_tokens != 7) {
+            throw std::invalid_argument("DFlash2 draft window must be 0 (fixed 7) or 7");
+        }
+        break;
     case SpeculativeBackend::DFlash:
         if (kMaximumDFlashDraftTokens == 0) {
             throw std::invalid_argument("DFlash is not supported by this target");
@@ -811,6 +822,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->cold_policy      = inputs.cold_policy;
     impl->cold_keep_tokens = inputs.cold_keep_tokens;
     impl->cold_host_bytes  = inputs.cold_host_bytes;
+    impl->cold_disk_path   = inputs.cold_disk_path;
+    impl->cold_disk_bytes  = inputs.cold_disk_bytes;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->graph_capture_ceiling = inputs.graph_capture_ceiling;
     impl->device              = inputs.device;
@@ -887,9 +900,11 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                                             ? DType::I8
                                             : (v == KvCacheStorage::Nvfp4Group16
                                                    ? DType::NVFP4
-                                                   : (v == KvCacheStorage::Fp8Group16
-                                                          ? DType::FP8_E4M3FN
-                                                          : DType::BF16)));
+                                                   : (v == KvCacheStorage::E8Group64
+                                                          ? DType::E8Kv
+                                                          : (v == KvCacheStorage::Fp8Group16
+                                                                 ? DType::FP8_E4M3FN
+                                                                 : DType::BF16))));
         }
     } else if constexpr (Variant::supports_per_layer_kv_defaults) {
         layer_overrides = Variant::default_layer_kv_dtypes(
@@ -903,7 +918,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                                    : std::nullopt,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
-        .draft_window        = options.speculative.draft_tokens,
+        .draft_window        = options.speculative.backend == SpeculativeBackend::DFlash2 &&
+                                       options.speculative.draft_tokens == 0
+                                       ? 7U
+                                       : options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
         .kv_dtype            = kv_profile.dtype,
         .kv_quant_group      = kv_profile.quant_group,
@@ -916,6 +934,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .cold_policy         = options.cold_policy,
         .cold_keep_tokens    = options.cold_keep_tokens,
         .cold_host_bytes     = options.cold_host_bytes,
+        .cold_disk_path      = options.cold_disk_path,
+        .cold_disk_bytes     = options.cold_disk_bytes,
         .device              = options.device,
         .context_cache       = options.context_cache,
     };

@@ -51,6 +51,10 @@ enum class ColdPolicy : std::uint8_t {
     None,
     Window,
     Host,
+    // Cold pages spill to per-layer disk files (compressed slots, one fixed
+    // stride per slot); the device slot pool acts as a working set. The
+    // engine keeps the file open for the process lifetime.
+    Disk,
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -157,6 +161,10 @@ struct EngineOptions {
     std::uint32_t cold_keep_tokens    = 128;
     // Pinned host-memory budget for ColdPolicy::Host offload. Default 4 GiB.
     std::uint64_t cold_host_bytes     = 4ULL << 30;
+    // ColdPolicy::Disk: directory for per-layer cold spill files (created on
+    // demand) and the total spill budget. Empty path uses the system temp dir.
+    std::string cold_disk_path;
+    std::uint64_t cold_disk_bytes     = 32ULL << 30;
     LoadProgress load_progress;
 };
 
