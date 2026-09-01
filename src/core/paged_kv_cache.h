@@ -16,6 +16,21 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+// Cold-slot sentinel encoding in block tables: entries <= -2 address the
+// entropy pool (slot base = -2 - entry). The pool itself is per-layer and
+// owned by the decoder state; the table row only carries the slot base.
+inline constexpr std::int32_t kPagedKVColdSentinelBase = -2;
+
+[[nodiscard]] inline bool paged_kv_is_cold(std::int32_t entry) noexcept {
+    return entry <= kPagedKVColdSentinelBase;
+}
+[[nodiscard]] inline std::int32_t paged_kv_cold_slot_base(std::int32_t entry) noexcept {
+    return kPagedKVColdSentinelBase - entry;
+}
+[[nodiscard]] inline std::int32_t paged_kv_cold_entry(std::int32_t slot_base) noexcept {
+    return kPagedKVColdSentinelBase - slot_base;
+}
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -23,6 +38,11 @@ struct PagedKVLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_table;
+    // Entropy-coded cold pool (single-sequence window view): fixed raw slots +
+    // validity flags. Empty when the cache has no cold pool.
+    Tensor cold_slots;
+    Tensor cold_slot_valid;
+    std::int32_t cold_slot_bytes = 0;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
@@ -36,6 +56,10 @@ struct PagedKVBatchLayerView {
     Tensor k_scale_pages;
     Tensor v_scale_pages;
     Tensor block_tables;
+    // Entropy-coded cold pool: fixed raw slots + validity flags per layer.
+    Tensor cold_slots;
+    Tensor cold_slot_valid;
+    std::int32_t cold_slot_bytes = 0;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
@@ -111,6 +135,10 @@ public:
     DeviceKVPageHandle() noexcept = default;
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+
+    // Physical page index within the owning pool (public read access for the
+    // cold-compression pass).
+    [[nodiscard]] std::int32_t index() const noexcept { return index_; }
 
 private:
     friend class DeviceKVPagePool;
@@ -351,13 +379,14 @@ public:
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
 
+    void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
+                         std::span<const std::int32_t> indices, cudaStream_t stream);
 private:
     friend class KVExecutionRowLease;
 
     [[nodiscard]] bool valid_handle(KVExecutionRowHandle handle) const noexcept;
     bool release_row(std::int32_t row, std::uint32_t generation) noexcept;
-    void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
-                         std::span<const std::int32_t> indices, cudaStream_t stream);
+
 
     KVExecutionTableSpec spec_;
     const DeviceKVPagePool* pages_ = nullptr;

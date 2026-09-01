@@ -460,6 +460,18 @@ struct SequenceState {
     std::vector<std::uint32_t> shared_prefix_references;
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
+
+    // Cold-pool bookkeeping: text pages currently detached into raw cold
+    // slots (logical page -> slot). Released with the sequence or when the
+    // rewrite path warms the prefix back into physical pages.
+    struct ColdPageEntry {
+        std::uint32_t page;
+        std::int32_t slot;
+    };
+    std::vector<ColdPageEntry> cold_pages;
+    // First logical page not yet offered to the cold pool; compression scans
+    // forward from here so each round only visits the newly retired pages.
+    std::uint32_t cold_frontier = 0;
 };
 
 struct SharedPrefixState {
@@ -694,6 +706,19 @@ public:
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
+
+    // Cold-pool maintenance (rev 2b): staging + per-step compress pass.
+    ColdPolicy cold_policy      = ColdPolicy::None;
+    std::uint32_t cold_keep_tokens = 128;
+    std::uint64_t cold_host_bytes  = 4ULL << 30;
+    void* cold_requant_codes       = nullptr;
+    void* cold_requant_scales      = nullptr;
+    std::uint32_t cold_requant_heads = 0;
+    void enqueue_cold_compressions(SequenceState& sequence);
+    void warm_cold_prefix(SequenceState& sequence, std::uint32_t end_page);
+    void restore_cold_page(SequenceState& sequence, std::uint32_t page, std::int32_t slot,
+                           const DeviceKVPageHandle& physical);
+
     std::size_t vision_handoff_peak_bytes    = 0;
 
 private:

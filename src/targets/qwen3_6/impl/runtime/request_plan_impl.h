@@ -802,6 +802,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         for (std::uint32_t page = 0; page < required; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.device_resident(logical)) { continue; }
+            // Cold-pool pages restore in place from their raw slots.
+            if (pages.cold_compressed(logical)) { continue; }
             if (!pages.host_resident(logical)) {
                 throw std::logic_error("checkpoint KV page has no restorable replica");
             }
