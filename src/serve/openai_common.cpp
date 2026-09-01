@@ -170,6 +170,19 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
         } else {
             *automatic_target = CacheBoundary{.evidence = evidence};
         }
+        // Issue #142: a second automatic candidate at the leading
+        // system/developer frontier (agent siblings share the long head).
+        if (policy.auto_system_shared_prefix) {
+            for (ChatTurn& turn : request.messages) {
+                if (turn.role == ChatRole::System || turn.role == ChatRole::Developer) {
+                    if (!turn.cache_boundary_after) {
+                        turn.cache_boundary_after = CacheBoundary{
+                            .evidence = ninfer::SharedCandidateEvidence::DefaultAutomatic};
+                    }
+                    break;
+                }
+            }
+        }
     }
     // OpenAI already defines the automatic/explicit write policy for every request. Existing
     // exact shared residents are still considered by the Engine independently of this switch.
