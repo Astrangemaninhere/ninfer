@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -271,12 +272,13 @@ struct FakeAdmissionCandidate {
 };
 
 struct FakeTargetDecision {
-    std::uint64_t id                  = 0;
-    std::uint64_t immediate_ns        = 100'000'000;
-    std::uint32_t degradation_units   = 1;
-    std::uint32_t dropped_checkpoints = 0;
-    bool evicts_continuation          = false;
-    bool shared_owner                 = false;
+    std::uint64_t id                   = 0;
+    std::uint64_t immediate_ns         = 100'000'000;
+    std::uint32_t degradation_units    = 1;
+    std::uint32_t dropped_checkpoints  = 0;
+    std::uint64_t host_kv_relief_bytes = 0;
+    bool evicts_continuation           = false;
+    bool shared_owner                  = false;
 
     friend bool operator==(const FakeTargetDecision&, const FakeTargetDecision&) = default;
 };
@@ -655,6 +657,17 @@ public:
     [[nodiscard]] bool
     target_feasible(std::span<const FakeTargetDecision> decisions) const noexcept {
         if (pressure_units(decisions) < required_pressure_actions) { return false; }
+        if (blocked_host_allocation_bytes != 0) {
+            std::uint64_t relief = 0;
+            for (const FakeTargetDecision& decision : decisions) {
+                if (decision.host_kv_relief_bytes >
+                    std::numeric_limits<std::uint64_t>::max() - relief) {
+                    return false;
+                }
+                relief += decision.host_kv_relief_bytes;
+            }
+            if (relief < blocked_host_allocation_bytes) { return false; }
+        }
         const bool has_eviction =
             std::any_of(decisions.begin(), decisions.end(),
                         [](const auto& decision) { return decision.evicts_continuation; });
@@ -979,7 +992,12 @@ public:
     std::optional<std::uint64_t> required_action_id;
     std::uint32_t pressure_assessment_delay_us    = 0;
     std::uint64_t pressure_checkpoint_recovery_ns = 100;
-    bool require_evictions                        = false;
+    // Host KV allocator-geometry block on the candidate: the arena has free bytes but the
+    // requested extent shape cannot be formed.  A target is feasible only once the selected
+    // decisions release at least this many Host KV bytes.
+    std::uint64_t blocked_host_allocation_bytes  = 0;
+    std::uint64_t eviction_host_kv_relief_bytes  = 0;
+    bool require_evictions                       = false;
     bool abort_start                              = false;
     bool abort_progress                           = false;
     bool progress_in_progress_once                = false;
@@ -1113,22 +1131,24 @@ FakePressurePlanningSession::decisions_for(std::uint32_t selected_candidate,
             });
         }
         decisions.push_back(FakeTargetDecision{
-            .id                  = 2000U + owner.private_handle->id,
-            .degradation_units   = 4,
-            .dropped_checkpoints = 1,
-            .evicts_continuation = true,
+            .id                    = 2000U + owner.private_handle->id,
+            .degradation_units     = 4,
+            .dropped_checkpoints   = 1,
+            .host_kv_relief_bytes  = program_->eviction_host_kv_relief_bytes,
+            .evicts_continuation   = true,
         });
     } else {
         decisions.push_back(FakeTargetDecision{
-            .id           = 3000U + owner.shared_handle->id,
-            .shared_owner = true,
+            .id                    = 3000U + owner.shared_handle->id,
+            .shared_owner          = true,
         });
         decisions.push_back(FakeTargetDecision{
-            .id                  = 4000U + owner.shared_handle->id,
-            .degradation_units   = 4,
-            .dropped_checkpoints = 1,
-            .evicts_continuation = true,
-            .shared_owner        = true,
+            .id                    = 4000U + owner.shared_handle->id,
+            .degradation_units     = 4,
+            .dropped_checkpoints   = 1,
+            .host_kv_relief_bytes  = program_->eviction_host_kv_relief_bytes,
+            .evicts_continuation   = true,
+            .shared_owner          = true,
         });
     }
     return decisions;
@@ -1211,34 +1231,105 @@ std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_clos
         }
         return decisions;
     };
-    for (int destructive = 0; destructive < 2; ++destructive) {
-        for (const std::size_t owner_index : order) {
-            const auto& alternatives = options_[selected_candidate][owner_index];
-            if (target.choices[owner_index] != 0 || alternatives.empty()) { continue; }
-            const auto found = std::find_if(
-                alternatives.begin(), alternatives.end(), [&](const FakeTargetDecision& decision) {
-                    return decision.evicts_continuation == (destructive != 0);
-                });
-            if (found == alternatives.end()) { continue; }
-            target.choices[owner_index] =
-                static_cast<std::uint16_t>(1U + (found - alternatives.begin()));
-            if (program_->target_feasible(selected_decisions())) {
-                auto existing =
-                    std::find_if(targets_.begin(), targets_.end(),
-                                 [&](const Target& prior) { return same_target(prior, target); });
-                std::uint32_t target_index = 0;
-                if (existing != targets_.end()) {
-                    target_index = static_cast<std::uint32_t>(existing - targets_.begin());
-                } else {
-                    target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
-                    targets_.push_back(std::move(target));
-                    target_index = static_cast<std::uint32_t>(targets_.size() - 1U);
-                    program_->pressure_target_count_peak =
-                        std::max(program_->pressure_target_count_peak, targets_.size());
-                }
-                return FakePressureTargetHandle{.generation = generation_, .index = target_index};
+    const auto decisions_with = [&](std::size_t override_owner, std::uint16_t override_choice) {
+        std::vector<FakeTargetDecision> decisions;
+        for (std::size_t index = 0; index < owners_.size(); ++index) {
+            const std::uint16_t choice =
+                index == override_owner ? override_choice : target.choices[index];
+            if (choice != 0) {
+                decisions.push_back(options_[selected_candidate][index][choice - 1U]);
             }
         }
+        return decisions;
+    };
+    // Mirror the real session's closure residual: required pressure units plus the candidate's
+    // Host KV allocator-geometry block, which selected decisions relieve by the Host KV pages
+    // they release (the fake approximates the real extent-geometry probe with release bytes).
+    struct Residual {
+        std::size_t units        = 0;
+        std::uint64_t blocked_bytes = 0;
+
+        [[nodiscard]] constexpr bool operator==(const Residual&) const noexcept = default;
+    };
+    const auto residual_for = [&](std::span<const FakeTargetDecision> decisions) {
+        std::size_t units     = program_->pressure_units(decisions);
+        std::uint64_t relief  = 0;
+        for (const FakeTargetDecision& decision : decisions) {
+            if (decision.host_kv_relief_bytes >
+                std::numeric_limits<std::uint64_t>::max() - relief) {
+                relief = std::numeric_limits<std::uint64_t>::max();
+            } else {
+                relief += decision.host_kv_relief_bytes;
+            }
+        }
+        const std::uint64_t blocked = program_->blocked_host_allocation_bytes;
+        return Residual{
+            .units = units >= program_->required_pressure_actions
+                         ? 0U
+                         : program_->required_pressure_actions - units,
+            .blocked_bytes = blocked > relief ? blocked - relief : 0,
+        };
+    };
+    const std::size_t maximum_steps = 16U * std::max<std::size_t>(1, owners_.size()) + 16U;
+    for (std::size_t step = 0; step < maximum_steps; ++step) {
+        if (program_->target_feasible(selected_decisions())) {
+            auto existing =
+                std::find_if(targets_.begin(), targets_.end(),
+                             [&](const Target& prior) { return same_target(prior, target); });
+            std::uint32_t target_index = 0;
+            if (existing != targets_.end()) {
+                target_index = static_cast<std::uint32_t>(existing - targets_.begin());
+            } else {
+                target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+                targets_.push_back(std::move(target));
+                target_index = static_cast<std::uint32_t>(targets_.size() - 1U);
+                program_->pressure_target_count_peak =
+                    std::max(program_->pressure_target_count_peak, targets_.size());
+            }
+            return FakePressureTargetHandle{.generation = generation_, .index = target_index};
+        }
+        const Residual residual = residual_for(selected_decisions());
+        std::optional<std::pair<std::size_t, std::uint16_t>> selected;
+        for (int destructive = 0; destructive < 2 && !selected; ++destructive) {
+            for (const std::size_t owner_index : order) {
+                const std::uint16_t current_choice = target.choices[owner_index];
+                const FakeTargetDecision* current =
+                    current_choice == 0
+                        ? nullptr
+                        : &options_[selected_candidate][owner_index][current_choice - 1U];
+                if (current != nullptr && current->evicts_continuation) { continue; }
+                const auto& alternatives = options_[selected_candidate][owner_index];
+                if (alternatives.empty()) { continue; }
+                std::optional<
+                    std::pair<std::uint16_t,
+                              std::tuple<std::size_t, std::uint64_t, std::uint64_t, std::uint64_t>>>
+                    owner_best;
+                for (std::uint16_t choice = 1; choice <= alternatives.size(); ++choice) {
+                    if (choice == current_choice) { continue; }
+                    const FakeTargetDecision& decision = alternatives[choice - 1U];
+                    const std::uint32_t prior_drops =
+                        current == nullptr ? 0 : current->dropped_checkpoints;
+                    const bool adds_destruction =
+                        decision.evicts_continuation || decision.dropped_checkpoints > prior_drops;
+                    if (adds_destruction != (destructive != 0)) { continue; }
+                    const Residual child_residual =
+                        residual_for(decisions_with(owner_index, choice));
+                    if (child_residual == residual) { continue; }
+                    const auto key = std::tuple{
+                        child_residual.units, child_residual.blocked_bytes,
+                        static_cast<std::uint64_t>(decision.degradation_units), decision.id};
+                    if (!owner_best || key < owner_best->second) {
+                        owner_best = std::pair{choice, key};
+                    }
+                }
+                if (owner_best) {
+                    selected = std::pair{owner_index, owner_best->first};
+                    break;
+                }
+            }
+        }
+        if (!selected) { return std::nullopt; }
+        target.choices[selected->first] = selected->second;
     }
     return std::nullopt;
 }
@@ -2424,6 +2515,44 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
             "guided pressure search returned to eager breadth-first assessment");
 }
 
+void test_guided_closure_relieves_allocator_geometry_block() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    std::array<std::uint32_t, 2> parked_ids{};
+    for (std::size_t index = 0; index < parked_ids.size(); ++index) {
+        const std::uint32_t content = static_cast<std::uint32_t>(61U + index);
+        const ActiveRequest parked =
+            start_active(manager, program, content, make_base(content), index + 1U);
+        parked_ids[index] = parked.sequence.id;
+        (void)finish_active(manager, program, parked);
+    }
+
+    // The candidate is blocked by the Host KV extent allocator (geometry), not by bytes: the
+    // arena has free capacity but the requested extent shape cannot be formed.  Evicting one
+    // whole parked context releases enough Host KV bytes to unblock it, so the guided closure
+    // must relieve the blocked amount by the pressure it has already selected instead of
+    // keeping the original unrelieved residual forever.
+    program.required_pressure_actions    = 1;
+    program.blocked_host_allocation_bytes = 1ULL << 30U;
+    program.eviction_host_kv_relief_bytes = 1ULL << 30U;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{70}, make_base(70), 3);
+    require(inspection.choice.has_value(),
+            "guided pressure search found no plan for an allocator-geometry block");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{70}, {});
+    require(program.started_action_ids.size() == 1,
+            "guided closure did not relieve the allocator-geometry block with a single eviction");
+    const bool evicted_parked =
+        std::any_of(parked_ids.begin(), parked_ids.end(), [&](std::uint32_t id) {
+            return std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+                             2000U + id) != program.started_action_ids.end();
+        });
+    require(evicted_parked,
+            "guided closure did not evict a parked context to relieve the allocator block");
+}
+
 void test_combined_target_reprices_cancelled_pressure_copy() {
     FakeManager manager = make_manager(1, 3);
     FakeProgram program;
@@ -2750,6 +2879,8 @@ int main() {
     run_test("joint two-owner pressure", test_two_owners_jointly_close_pressure);
     run_test("guided deep retention",
              test_guided_pressure_reaches_deep_retention_before_maximal_fallback);
+    run_test("guided closure relieves allocator geometry block",
+             test_guided_closure_relieves_allocator_geometry_block);
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);

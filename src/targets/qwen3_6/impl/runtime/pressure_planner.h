@@ -533,6 +533,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
                                         std::optional<std::size_t> override_owner,
                                         const PressureDecision* override_decision) {
         detail::PhysicalDelta pressure;
+        std::vector<const ContinuationHandle*> selected_private_handles;
+        std::vector<const PressureDecision*> selected_private_decisions;
+        std::vector<const SharedPrefixHandle*> selected_shared_handles;
+        std::vector<const PressureDecision*> selected_shared_decisions;
+        selected_private_handles.reserve(owners.size());
+        selected_private_decisions.reserve(owners.size());
+        selected_shared_handles.reserve(owners.size());
+        selected_shared_decisions.reserve(owners.size());
         for (std::size_t index = 0; index < owners.size(); ++index) {
             const PressureDecision* decision = nullptr;
             if (override_owner && *override_owner == index) {
@@ -551,11 +559,28 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
                 pressure.added, decision->effect.added);
             pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
                 pressure.removed, decision->effect.removed);
+            if (owners[index].shared) {
+                selected_shared_handles.push_back(owners[index].shared_handle);
+                selected_shared_decisions.push_back(decision);
+            } else {
+                selected_private_handles.push_back(owners[index].private_handle);
+                selected_private_decisions.push_back(decision);
+            }
         }
         detail::PhysicalResources residual =
             program->guided_materialization_deficit(*admission.impl_, pressure);
-        residual.host.kv_bytes =
-            std::max(residual.host.kv_bytes, admission.impl_->blocked_host_allocation_bytes);
+        // The candidate's Host KV allocation can be blocked by the extent allocator's geometry
+        // even when free bytes are ample (resource-scheduling-and-context-cache.md 3.1 keeps
+        // allocator geometry independent from total bytes).  Geometry is not expressible in the
+        // aggregated residual, so probe the allocator directly with the decisions selected so
+        // far: while the demote/drop/eviction combination still cannot be allocated, keep a
+        // non-zero residual so the closure keeps driving toward relief instead of closing on an
+        // infeasible target and falling back to a root re-prefill.
+        if (!program->guided_host_allocation_feasible(
+                *admission.impl_, selected_private_handles, selected_private_decisions,
+                selected_shared_handles, selected_shared_decisions)) {
+            residual.host.kv_bytes = std::max<std::size_t>(1, residual.host.kv_bytes);
+        }
         return residual;
     };
     const detail::PhysicalResources capacity = program->admission_capacity();
@@ -733,6 +758,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
     detail::PhysicalDelta approximate_pressure;
     std::uint32_t total_degradation = 0;
     std::uint32_t total_dropped     = 0;
+    std::vector<const ContinuationHandle*> selected_private_handles;
+    std::vector<const PressureDecision*> selected_private_decisions;
+    std::vector<const SharedPrefixHandle*> selected_shared_handles;
+    std::vector<const PressureDecision*> selected_shared_decisions;
+    selected_private_handles.reserve(owners.size());
+    selected_private_decisions.reserve(owners.size());
+    selected_shared_handles.reserve(owners.size());
+    selected_shared_decisions.reserve(owners.size());
     for (std::size_t index = 0; index < owners.size(); ++index) {
         const std::uint16_t choice = node.owner_choices[index];
         if (choice > options.owners[index].size()) {
@@ -745,6 +778,13 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
         approximate_pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
             approximate_pressure.removed, decision.effect.removed);
         estimated_pressure.append(decision.transfer_requirements);
+        if (owners[index].shared) {
+            selected_shared_handles.push_back(owners[index].shared_handle);
+            selected_shared_decisions.push_back(&decision);
+        } else {
+            selected_private_handles.push_back(owners[index].private_handle);
+            selected_private_decisions.push_back(&decision);
+        }
         const std::uint32_t units = NINFER_QWEN36_RUNTIME_NS::degradation_units(decision);
         total_degradation         = NINFER_QWEN36_RUNTIME_NS::planning_saturating_u32(
             static_cast<std::uint64_t>(total_degradation) + units);
@@ -761,8 +801,15 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
     }
     detail::PhysicalResources residual =
         program->guided_materialization_deficit(*candidate.impl_, approximate_pressure);
-    residual.host.kv_bytes =
-        std::max(residual.host.kv_bytes, candidate.impl_->blocked_host_allocation_bytes);
+    // Same allocator-geometry probe as the guided closure: while the selected decisions'
+    // demote/drop/eviction combination still cannot be allocated by the Host KV extent
+    // allocator, keep a non-zero residual so guidance does not report a target as closed
+    // that the exact composition would reject.
+    if (!program->guided_host_allocation_feasible(
+            *candidate.impl_, selected_private_handles, selected_private_decisions,
+            selected_shared_handles, selected_shared_decisions)) {
+        residual.host.kv_bytes = std::max<std::size_t>(1, residual.host.kv_bytes);
+    }
 
     const detail::PhysicalResources capacity = program->admission_capacity();
     constexpr std::uint64_t kResidualOne     = 1ULL << 20U;

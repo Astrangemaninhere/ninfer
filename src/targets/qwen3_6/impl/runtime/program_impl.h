@@ -6526,6 +6526,140 @@ ProgramImplCore::guided_materialization_deficit(const AdmissionCandidateImpl& ad
     return positive_resource_difference(required, admission_capacity());
 }
 
+bool ProgramImplCore::guided_host_allocation_feasible(
+    const AdmissionCandidateImpl& admission,
+    std::span<const ContinuationHandle* const> private_owners,
+    std::span<const qwen3_6::detail::PressureDecision* const> private_decisions,
+    std::span<const SharedPrefixHandle* const> shared_owners,
+    std::span<const qwen3_6::detail::PressureDecision* const> shared_decisions) const {
+    if (admission.planning_revision != resource_revision_ ||
+        private_owners.size() != private_decisions.size() ||
+        shared_owners.size() != shared_decisions.size()) {
+        return false;
+    }
+    std::vector<HostKVPageLayout> host_layouts;
+    std::vector<HostKVAllocationRequest> host_requests;
+    std::vector<HostKVPageReplicaRelease> host_releases;
+    std::vector<HostKVPageReplicaRelease> last_reference_releases;
+    const auto demotion_count = [](const qwen3_6::detail::PressureDecision& decision) {
+        const auto count = [](const auto& changes) {
+            return static_cast<std::size_t>(
+                std::count_if(changes.begin(), changes.end(), [](const auto& action) {
+                    return action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost;
+                }));
+        };
+        return count(decision.main_kv_changes) + count(decision.backend_kv_changes);
+    };
+    std::size_t demotion_total = 0;
+    for (const qwen3_6::detail::PressureDecision* decision : private_decisions) {
+        if (decision != nullptr) { demotion_total += demotion_count(*decision); }
+    }
+    for (const qwen3_6::detail::PressureDecision* decision : shared_decisions) {
+        if (decision != nullptr) { demotion_total += demotion_count(*decision); }
+    }
+    host_layouts.reserve(demotion_total);
+    host_requests.reserve(demotion_total);
+
+    const auto append_actions = [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                    KVAddressSpaceHandle address,
+                                    std::span<const qwen3_6::detail::PressureKVDecision> changes) {
+        for (const qwen3_6::detail::PressureKVDecision& action : changes) {
+            if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DropHostDuplicate) {
+                const std::uint32_t mapped = addresses.mapped_pages(address);
+                if (action.begin_page > mapped || action.page_count > mapped - action.begin_page) {
+                    return false;
+                }
+                for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
+                    host_releases.push_back(HostKVPageReplicaRelease{
+                        .pages = &pages,
+                        .page  = addresses.logical_page(address, action.begin_page + offset),
+                    });
+                }
+            } else if (action.kind == qwen3_6::detail::PressureKVDecisionKind::DemoteToHost) {
+                host_layouts.push_back(plan_host_kv_page_layout(pages.physical_pool().geometry()));
+                host_requests.push_back(
+                    HostKVAllocationRequest{.layout = &host_layouts.back(), .pages = action.page_count});
+            }
+        }
+        return true;
+    };
+    const auto append_eviction_releases = [&](const KVAddressSpaceStore& addresses,
+                                              LogicalKVPageStore& pages,
+                                              KVAddressSpaceHandle address) {
+        const std::uint32_t mapped = addresses.mapped_pages(address);
+        for (std::uint32_t offset = 0; offset < mapped; ++offset) {
+            const LogicalKVPageHandle page = addresses.logical_page(address, offset);
+            if (pages.host_resident(page)) {
+                last_reference_releases.push_back(
+                    HostKVPageReplicaRelease{.pages = &pages, .page = page});
+            }
+        }
+        return true;
+    };
+    const auto append_private = [&](const ContinuationHandle* owner,
+                                    const qwen3_6::detail::PressureDecision& decision) {
+        if (owner == nullptr || ContractAccess::owner(*owner) != this ||
+            !valid_continuation(*owner)) {
+            return false;
+        }
+        const SequenceState& sequence = continuation_states[ContractAccess::index(*owner)];
+        if (!sequence.kv) { return false; }
+        if (decision.evicts_continuation) {
+            return append_eviction_releases(*text_kv_addresses, *text_kv_pages, sequence.kv->text) &&
+                   (sequence.kv->backend == std::nullopt || backend_kv_addresses == nullptr ||
+                    backend_kv_pages == nullptr ||
+                    append_eviction_releases(*backend_kv_addresses, *backend_kv_pages,
+                                             *sequence.kv->backend));
+        }
+        return append_actions(*text_kv_addresses, *text_kv_pages, sequence.kv->text,
+                              decision.main_kv_changes) &&
+               (decision.backend_kv_changes.empty() ||
+                (sequence.kv->backend && backend_kv_addresses && backend_kv_pages &&
+                 append_actions(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
+                                decision.backend_kv_changes)));
+    };
+    const auto append_shared = [&](const SharedPrefixHandle* owner,
+                                   const qwen3_6::detail::PressureDecision& decision) {
+        if (owner == nullptr || ContractAccess::owner(*owner) != this ||
+            !valid_shared_prefix(*owner)) {
+            return false;
+        }
+        const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(*owner)];
+        if (!shared.kv) { return false; }
+        if (decision.evicts_continuation) {
+            return append_eviction_releases(*text_kv_addresses, *text_kv_pages, shared.kv->text) &&
+                   (shared.kv->backend == std::nullopt || backend_kv_addresses == nullptr ||
+                    backend_kv_pages == nullptr ||
+                    append_eviction_releases(*backend_kv_addresses, *backend_kv_pages,
+                                             *shared.kv->backend));
+        }
+        return append_actions(*text_kv_addresses, *text_kv_pages, shared.kv->text,
+                              decision.main_kv_changes) &&
+               (decision.backend_kv_changes.empty() ||
+                (shared.kv->backend && backend_kv_addresses && backend_kv_pages &&
+                 append_actions(*backend_kv_addresses, *backend_kv_pages, *shared.kv->backend,
+                                decision.backend_kv_changes)));
+    };
+    for (std::size_t index = 0; index < private_owners.size(); ++index) {
+        if (private_decisions[index] == nullptr ||
+            !append_private(private_owners[index], *private_decisions[index])) {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < shared_owners.size(); ++index) {
+        if (shared_decisions[index] == nullptr ||
+            !append_shared(shared_owners[index], *shared_decisions[index])) {
+            return false;
+        }
+    }
+    // A target only needs Host KV allocation when it demotes pages.  Without demotion requests
+    // there is no allocator geometry to satisfy, regardless of what the decisions release.
+    if (host_requests.empty()) { return true; }
+    return host_kv_extents != nullptr &&
+           host_kv_extents->can_allocate_after_page_releases(
+               host_releases, last_reference_releases, host_requests);
+}
+
 bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
     const detail::PhysicalResources occupied = physical_occupancy();
     const detail::PhysicalResources limits   = admission_capacity();

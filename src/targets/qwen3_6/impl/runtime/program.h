@@ -1069,6 +1069,18 @@ private:
     [[nodiscard]] detail::PhysicalResources
     guided_materialization_deficit(const AdmissionCandidateImpl& admission,
                                    const detail::PhysicalDelta& pressure) const;
+    // Projects the candidate plus the selected pressure decisions onto the Host KV extent
+    // allocator: DemoteToHost actions become allocation requests, DropHostDuplicate actions
+    // release ordinary replicas, and evictions release the owner's host-resident pages as
+    // last-reference releases.  This mirrors the host side of compose_materialization without
+    // building a complete post-state, so the guided closure can tell whether the allocator
+    // geometry (which is not a byte deficit) is still blocking the target.
+    [[nodiscard]] bool guided_host_allocation_feasible(
+        const AdmissionCandidateImpl& admission,
+        std::span<const ContinuationHandle* const> private_owners,
+        std::span<const qwen3_6::detail::PressureDecision* const> private_decisions,
+        std::span<const SharedPrefixHandle* const> shared_owners,
+        std::span<const qwen3_6::detail::PressureDecision* const> shared_decisions) const;
     [[nodiscard]] bool
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
