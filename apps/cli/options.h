@@ -27,6 +27,8 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    std::string kv_layer_storage_spec;
+    bool kv_layer_storage_explicit = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;

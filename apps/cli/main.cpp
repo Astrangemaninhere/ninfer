@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/kv_options.h"
 #include "product/load_progress/load_progress.h"
 #include "product/prompt_input/prompt_input.h"
 
@@ -283,6 +284,13 @@ int main(int argc, char** argv) {
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
+        if (cli.kv_layer_storage_explicit) {
+            const auto table = ninfer::product::parse_kv_layer_storage(cli.kv_layer_storage_spec);
+            for (std::size_t i = 0; i < table.size(); ++i) {
+                engine_options.kv_layer_storage[i] = table[i];
+            }
+            engine_options.kv_layer_storage_explicit = true;
+        }
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;
