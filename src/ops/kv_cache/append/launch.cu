@@ -128,7 +128,8 @@ void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, con
 
 void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
                    const Tensor& lanes, CyclicKVCacheLayerView cache,
-                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
+                   const KVCacheAppendPrefixPlan& plan, std::uint32_t window,
+                   cudaStream_t stream) {
     validate_plan(k, plan);
     if (plan.max_count == 0) return;
     auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k.data);
@@ -141,10 +142,22 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     const int padded    = static_cast<int>(cache.padded_capacity);
 
     const dim3 grid(1 + (plan.max_count - 1) / 4, k.ne[3], 1);
-    kv_cache_append_prefix_cyclic_kernel<<<grid, kBlock, 0, stream>>>(
-        input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
-        plan.tokens, padded);
-    CUDA_CHECK(cudaGetLastError());
+    const auto launch_window = [&]<int Window>() {
+        kv_cache_append_prefix_cyclic_kernel<Window><<<grid, kBlock, 0, stream>>>(
+            input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
+            plan.tokens, padded);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    switch (window) {
+    case 2048:
+        launch_window.template operator()<2048>();
+        break;
+    case 4096:
+        launch_window.template operator()<4096>();
+        break;
+    default:
+        throw std::invalid_argument("kv_cache_append_prefix: unsupported cyclic window");
+    }
 }
 
 } // namespace
@@ -211,8 +224,9 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
 void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                    const Tensor& counts, const Tensor& lanes,
                                    CyclicKVCacheLayerView cache,
-                                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
-    launch_cyclic(k, v, positions, counts, lanes, cache, plan, stream);
+                                   const KVCacheAppendPrefixPlan& plan, std::uint32_t window,
+                                   cudaStream_t stream) {
+    launch_cyclic(k, v, positions, counts, lanes, cache, plan, window, stream);
 }
 
 } // namespace ninfer::ops::detail

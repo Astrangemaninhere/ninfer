@@ -65,8 +65,11 @@ target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cu
 add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
+  ops/launcher/bidirectional_gqa_attention.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
+  ops/launcher/dflash2_grouped_conv.cu
+  ops/launcher/dflash2_selector.cu
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
@@ -83,6 +86,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/rope.cu
   ops/launcher/sampling.cu
   ops/launcher/scalar.cu
+  ops/launcher/swa.cu
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
   ops/launcher/silu_and_mul.cu
@@ -238,8 +242,11 @@ add_library(ninfer_ops STATIC
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
+  ops/wrapper/bidirectional_gqa_attention.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
+  ops/wrapper/dflash2_grouped_conv.cpp
+  ops/wrapper/dflash2_selector.cpp
   ops/wrapper/embedding.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
@@ -261,6 +268,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/rmsnorm.cpp
   ops/wrapper/rope.cpp
   ops/wrapper/sampling.cpp
+  ops/wrapper/swa.cpp
   ops/wrapper/scalar.cpp
   ops/wrapper/scatter.cpp
   ops/wrapper/sigmoid_mul.cpp

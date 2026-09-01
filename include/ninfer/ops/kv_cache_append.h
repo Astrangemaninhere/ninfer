@@ -79,15 +79,17 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  * Append device-selected exact BF16 prefixes to lane-owned cyclic storage.
  *
  * k/v, positions, counts, and their exact-copy and mutation contracts match the paged overload;
- * lanes[b] selects the destination lane. The fixed geometry is D=128, Hkv=8, capacity=4096, and
- * absolute position p maps to slot p mod 4096. The caller guarantees that each row's existing live
- * interval ends immediately before positions[0,b], advancing it by counts[b] makes every
- * overwritten old slot dead, and one row commits at most the ring capacity. Consequently, no two
- * live writes race for one physical slot. The Op does not own or publish the lane frontier.
+ * lanes[b] selects the destination lane. The registered geometry is D=128, Hkv=8, capacity equal
+ * to the window in {2048, 4096}, and absolute position p maps to slot p mod window. The caller
+ * guarantees that each row's existing live interval ends immediately before positions[0,b],
+ * advancing it by counts[b] makes every overwritten old slot dead, and one row commits at most the
+ * ring capacity. Consequently, no two live writes race for one physical slot. The Op does not own
+ * or publish the lane frontier.
  */
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& lanes,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
-                            CyclicKVCacheLayerView cache, cudaStream_t stream);
+                            CyclicKVCacheLayerView cache, std::uint32_t window,
+                            cudaStream_t stream);
 
 } // namespace ninfer::ops

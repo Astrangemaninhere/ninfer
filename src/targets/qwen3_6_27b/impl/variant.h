@@ -19,6 +19,7 @@ struct Variant {
     using TextConfig                     = detail::TextConfig;
     using VisionConfig                   = detail::VisionConfig;
     using DFlashConfig                   = detail::DFlashConfig;
+    using DFlash2Config                  = detail::DFlash2Config;
     using ModelView                      = detail::RuntimeModelView;
     using FullAttentionProjectionWeights = detail::FullAttentionProjectionPayload;
     using GdnProjectionWeights           = detail::GdnProjectionPayload;
@@ -35,7 +36,12 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    static constexpr bool supports_dflash2                     = DFlash2Config::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
+
+    [[nodiscard]] static constexpr bool dflash2_weights(WeightsProfile profile) {
+        return profile == WeightsProfile::Qwen38Nvfp4DFlash2;
+    }
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
@@ -125,6 +131,9 @@ struct Variant {
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
                           std::uint32_t batch_size);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    dflash2_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
+                           std::uint32_t batch_size);
 };
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

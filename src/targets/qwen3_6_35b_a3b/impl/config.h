@@ -70,6 +70,7 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 
 struct DFlashConfig {
     static constexpr bool supported        = true;
+    static constexpr bool bf16_weights     = false;
     static constexpr int layers            = 6;
     static constexpr int local_layers      = 5;
     static constexpr int feature_layers    = 8;
@@ -88,6 +89,39 @@ struct DFlashConfig {
     static constexpr float attention_scale = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{1,  6,  11, 16,
                                                                            22, 27, 32, 37};
+};
+
+// The 35B-A3B package registers no DFlash2 draft; the family runtime still
+// needs a concrete config type for its compile-time aliases and recipe
+// instantiations, so it mirrors the 27B DFlash2 shape.
+struct DFlash2Config {
+    static constexpr bool supported     = false;
+    static constexpr bool bf16_weights  = true;
+    static constexpr int layers         = 5;
+    static constexpr bool full_only     = false;
+    static constexpr int local_layers   = 5;
+    static constexpr int full_layers    = 0;
+    static constexpr int feature_layers = 5;
+    static constexpr int feature_rows   = feature_layers * TextConfig::hidden;
+    static constexpr int hidden         = TextConfig::hidden;
+    static constexpr int intermediate   = 17408;
+    static constexpr int query_heads    = 32;
+    static constexpr int kv_heads       = 8;
+    static constexpr int head_dim       = 128;
+    static constexpr int query_size     = query_heads * head_dim;
+    static constexpr int kv_size        = kv_heads * head_dim;
+    static constexpr int local_capacity = 2048;
+    static constexpr std::uint32_t local_window = 2048;
+    static constexpr int mask_token     = 248070;
+    static constexpr float rms_epsilon  = 1.0e-6F;
+    static constexpr float rope_theta   = 1.0e7F;
+    static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr int block_drafts   = 7;
+    static constexpr int conv_group_size = 16;
+    static constexpr int conv_kernel_size = 2;
+    static constexpr int selector_rank   = 256;
+    static constexpr int selector_top_k  = 16;
+    static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
 };
 
 inline constexpr float kAttentionScale                   = 0.0625F;

@@ -72,6 +72,17 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
+EngineOptions Package::resolved_auto_speculative(const EngineOptions& options,
+                                                    WeightsProfile) {
+    EngineOptions resolved = options;
+    if (options.speculative.backend == SpeculativeBackend::Auto) {
+        // This target carries no DFlash2 weights; auto falls back to MTP.
+        resolved.speculative.backend = SpeculativeBackend::Mtp;
+        if (resolved.speculative.draft_tokens == 0) { resolved.speculative.draft_tokens = 3; }
+    }
+    return resolved;
+}
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(

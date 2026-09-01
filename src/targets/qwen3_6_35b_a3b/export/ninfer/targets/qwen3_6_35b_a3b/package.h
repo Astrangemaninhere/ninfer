@@ -118,6 +118,9 @@ struct Package {
 
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
+    // Resolves --spec auto (this target has no DFlash2 weights; auto -> MTP).
+    [[nodiscard]] static EngineOptions resolved_auto_speculative(const EngineOptions& options,
+                                                                 WeightsProfile weights_profile);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
